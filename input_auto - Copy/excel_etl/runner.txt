@@ -6,12 +6,13 @@ import re
 import json
 from pathlib import Path
 from typing import Callable, Optional, List, Tuple, Dict, Any
+import pandas as pd
 
 import yaml
 
 from .utils.logger import get_logger
 from .utils.resources import resource_path
-from .utils.io import write_to_template
+# from .utils.io import write_to_template  # disabled: no xlsx output creation per current requirements
 from .extractors.registry import get_extractor
 
 # IMPORTANT: ensure extractors import/registration happens
@@ -86,8 +87,8 @@ def run_batch(
     log_cb: Optional[Callable[[str], None]] = None,
 ) -> None:
     """
-    Process all supported files in input_dir, route each to an extractor,
-    write results into the provided Excel template, and save outputs to out_dir.
+    Process inputs under category subfolders and build a master output dictionary.
+    Do NOT create any Excel output; only aggregate values for downstream use.
 
     Loads bundled configs:
       - config/routing.yaml
@@ -108,7 +109,7 @@ def run_batch(
 
     # Load bundled configs
     routing_cfg = _load_yaml("config/routing.yaml")
-    template_map = _load_yaml("config/template_map.yaml")
+    # template_map is not needed when not writing workbooks
 
     in_dir = Path(input_dir)
     out = Path(out_dir)
@@ -125,8 +126,36 @@ def run_batch(
 
     emit(f"Found {len(all_files)} input files across categories.\n")
 
+    # Load user mapping from user_input.xlsx (if present)
+    mapper_path = in_dir / "user_input.xlsx"
+    mapping: Dict[Tuple[str, str], str] = {}
+    if mapper_path.is_file():
+        try:
+            df_map = pd.read_excel(mapper_path, sheet_name="rwa_pbt_mapper")
+            # expected columns: mapping (frp_rwa/frp_pbt), year (Opening/2025..), filename keyword (lowercase)
+            for _, row in df_map.iterrows():
+                mval = str(row.get("mapping", "")).strip()
+                year = str(row.get("year", "")).strip()
+                kw = str(row.get("filename keyword", "")).strip().lower()
+                if mval and year and kw:
+                    mapping[(mval, year)] = kw
+            emit("Loaded user mapping from user_input.xlsx.\n")
+        except Exception as e:
+            emit(f"WARNING: Could not read user_input.xlsx mapping: {e}\n")
+    else:
+        emit("INFO: user_input.xlsx not found; proceeding without keyword mapping.\n")
+
     summary = []
     processed_count = 0
+
+    # Initialize master output structure
+    years = ["Opening", "2025", "2026", "2027", "2028", "2029"]
+    output: Dict[str, Dict[str, Any]] = {
+        "frp_rwa": {"Opening": {"Total": None, "CIB": None, "IWPB": None, "CC": None}, **{y: None for y in years if y != "Opening"}},
+        "frp_pbt": {y: None for y in years},
+        "growth_rate": {y: None for y in years},
+        "discount_rate": {y: None for y in years},
+    }
 
     for cat in categories:
         files = cat_to_files.get(cat, [])
@@ -136,37 +165,47 @@ def run_batch(
 
         emit(f"[{cat}] {len(files)} file(s)\n")
 
+        # No per-file Excel output; we still ensure category output folder exists for JSON outputs
         cat_out_dir = out / cat
         cat_out_dir.mkdir(parents=True, exist_ok=True)
 
-        for i, fp in enumerate(files, 1):
-            emit(f"  [{i}/{len(files)}] {fp.name}\n")
-            try:
-                # Pick extractor by routing rules
-                ex_name, ex_opts = _choose_extractor(fp, routing_cfg, category=cat)
-                if not ex_name:
-                    emit("    No extractor matched. Skipping.\n")
-                    summary.append({"file": fp.name, "category": cat, "status": "skipped"})
-                    continue
+        # Category-specific handling
+        if cat == "frp_rwa":
+            # Determine the 'Opening' source file based on mapping keyword; fallback to first file
+            opening_kw = mapping.get(("frp_rwa", "Opening"))
+            chosen_file: Optional[Path] = None
+            if opening_kw:
+                for fp in files:
+                    if opening_kw in fp.name.lower():
+                        chosen_file = fp
+                        break
+            if chosen_file is None and files:
+                chosen_file = files[0]
 
-                extractor_cls = get_extractor(ex_name)
-                extractor = extractor_cls()
-                emit(f"    Using extractor: {ex_name}\n")
+            if chosen_file is not None:
+                emit(f"  [frp_rwa:Opening] Using file {chosen_file.name}\n")
+                try:
+                    extractor_cls = get_extractor("rwa_opening")
+                    extractor = extractor_cls()
+                    sheet_to_key = {"Consolidated": "Total", "CIB": "CIB", "IWB": "IWPB", "OTH": "CC"}
+                    for sheet_name, subkey in sheet_to_key.items():
+                        try:
+                            res = extractor.extract(chosen_file, options={"sheet": sheet_name})
+                            val = res.get("value") if isinstance(res, dict) else None
+                            output["frp_rwa"]["Opening"][subkey] = val
+                            emit(f"    {sheet_name} -> {subkey}: {val}\n")
+                        except Exception as e:
+                            output["frp_rwa"]["Opening"][subkey] = None
+                            emit(f"    WARN: {sheet_name} extraction failed: {e}\n")
+                except Exception as e:
+                    emit(f"    ERROR: rwa_opening failed on {chosen_file.name}: {e}\n")
+            else:
+                emit("  [frp_rwa:Opening] No suitable file found.\n")
+        else:
+            # Other categories: leave values as None for now
+            pass
 
-                # IMPORTANT: pass the file path; extractor reads via readers.read_any()
-                result = extractor.extract(fp, options=ex_opts)
-
-                # Write to the template with category-specific mapping
-                out_file = cat_out_dir / f"{fp.stem}_out.xlsx"
-                write_to_template(template_path, template_map, result, out_file, category=cat)
-                emit(f"    Wrote: {out_file.relative_to(out)}\n")
-
-                summary.append({"file": fp.name, "category": cat, "status": "ok", **result})
-                processed_count += 1
-            except Exception as e:
-                emit(f"    ERROR: {e}\n")
-                summary.append({"file": fp.name, "category": cat, "status": "error", "error": str(e)})
-
-    # Save a machine-readable run summary
+    # Save outputs
     (out / "summary.json").write_text(json.dumps(summary, indent=2), encoding="utf-8")
-    emit("Done.\n")
+    (out / "output_data.json").write_text(json.dumps(output, indent=2), encoding="utf-8")
+    emit("Aggregation complete.\n")
