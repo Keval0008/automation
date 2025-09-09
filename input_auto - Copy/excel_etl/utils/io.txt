@@ -1,13 +1,30 @@
 from pathlib import Path
-from typing import Dict, Any
+from typing import Dict, Any, Optional
 from openpyxl import load_workbook
 
-def write_to_template(template_path: str, template_map: dict, data: Dict[str, Any], out_path: Path):
+def write_to_template(
+    template_path: str,
+    template_map: dict,
+    data: Dict[str, Any],
+    out_path: Path,
+    category: Optional[str] = None,
+) -> None:
     wb = load_workbook(template_path)
-    for field, loc in template_map.get("fields", {}).items():
+
+    # Resolve mapping: prefer per-category mapping if present
+    fields_map: Dict[str, Dict[str, str]] = {}
+    if category and isinstance(template_map.get("categories"), dict):
+        cat_map = template_map["categories"].get(category)
+        if isinstance(cat_map, dict):
+            fields_map = dict(cat_map.get("fields", {}))
+    if not fields_map:
+        fields_map = dict(template_map.get("fields", {}))
+
+    for field, loc in fields_map.items():
         if field not in data:
             continue
         ws = wb[loc["sheet"]]
         ws[loc["cell"]] = data[field]
+
     out_path.parent.mkdir(parents=True, exist_ok=True)
     wb.save(out_path)
