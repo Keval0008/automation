@@ -28,7 +28,7 @@ def _load_yaml(relpath: str) -> dict:
     return yaml.safe_load(resource_path(relpath).read_text(encoding="utf-8"))
 
 
-def _choose_extractor(path: Path, routing_cfg: dict) -> Optional[str]:
+def _choose_extractor(path: Path, routing_cfg: dict, category: Optional[str] = None) -> Optional[str]:
     """
     Decide which extractor to use for a given input file based on routing rules.
     Current rules support filename_regex; extend as needed.
@@ -37,6 +37,10 @@ def _choose_extractor(path: Path, routing_cfg: dict) -> Optional[str]:
     for rule in routing_cfg.get("routes", []):
         cond = rule.get("when", {})
         ok = True
+
+        # in-folder category match (case-insensitive)
+        if "in_folder" in cond and category is not None:
+            ok &= (cond["in_folder"].lower() == category.lower())
 
         # filename regex match (case-insensitive)
         if "filename_regex" in cond:
@@ -59,6 +63,16 @@ def _gather_input_files(in_dir: Path, exts: List[str]) -> List[Path]:
         files.extend(in_dir.glob(f"*{ext}"))
     # sort by name for deterministic order
     return sorted(files, key=lambda p: p.name.lower())
+
+
+def _gather_category_files(master_dir: Path, category: str, exts: List[str]) -> List[Path]:
+    """
+    Collect files from a specific subfolder (category) under the master input folder.
+    """
+    cat_dir = master_dir / category
+    if not cat_dir.is_dir():
+        return []
+    return _gather_input_files(cat_dir, exts)
 
 
 def run_batch(
@@ -96,38 +110,58 @@ def run_batch(
     out = Path(out_dir)
     out.mkdir(parents=True, exist_ok=True)
 
-    # Gather inputs: support CSV, XLS, XLSX, XLSB
-    files = _gather_input_files(in_dir, exts=[".csv", ".xls", ".xlsx", ".xlsb"])
-    emit(f"Found {len(files)} input files.\n")
+    categories = ["frp_rwa", "frp_pbt", "growth_rate", "discount_rate"]
+
+    all_files: List[Path] = []
+    cat_to_files: dict = {}
+    for cat in categories:
+        files = _gather_category_files(in_dir, cat, exts=[".csv", ".xls", ".xlsx", ".xlsb"])
+        cat_to_files[cat] = files
+        all_files.extend(files)
+
+    emit(f"Found {len(all_files)} input files across categories.\n")
 
     summary = []
+    processed_count = 0
 
-    for i, fp in enumerate(files, 1):
-        emit(f"[{i}/{len(files)}] {fp.name}\n")
-        try:
-            # Pick extractor by routing rules
-            ex_name = _choose_extractor(fp, routing_cfg)
-            if not ex_name:
-                emit("  No extractor matched. Skipping.\n")
-                summary.append({"file": fp.name, "status": "skipped"})
-                continue
+    for cat in categories:
+        files = cat_to_files.get(cat, [])
+        if not files:
+            emit(f"[{cat}] No files found.\n")
+            continue
 
-            extractor_cls = get_extractor(ex_name)
-            extractor = extractor_cls()
-            emit(f"  Using extractor: {ex_name}\n")
+        emit(f"[{cat}] {len(files)} file(s)\n")
 
-            # IMPORTANT: pass the file path; extractor reads via readers.read_any()
-            result = extractor.extract(fp)
+        cat_out_dir = out / cat
+        cat_out_dir.mkdir(parents=True, exist_ok=True)
 
-            # Write to the template
-            out_file = out / f"{fp.stem}_out.xlsx"
-            write_to_template(template_path, template_map, result, out_file)
-            emit(f"  Wrote: {out_file.name}\n")
+        for i, fp in enumerate(files, 1):
+            emit(f"  [{i}/{len(files)}] {fp.name}\n")
+            try:
+                # Pick extractor by routing rules
+                ex_name = _choose_extractor(fp, routing_cfg, category=cat)
+                if not ex_name:
+                    emit("    No extractor matched. Skipping.\n")
+                    summary.append({"file": fp.name, "category": cat, "status": "skipped"})
+                    continue
 
-            summary.append({"file": fp.name, "status": "ok", **result})
-        except Exception as e:
-            emit(f"  ERROR: {e}\n")
-            summary.append({"file": fp.name, "status": "error", "error": str(e)})
+                extractor_cls = get_extractor(ex_name)
+                extractor = extractor_cls()
+                emit(f"    Using extractor: {ex_name}\n")
+
+                # IMPORTANT: pass the file path; extractor reads via readers.read_any()
+                result = extractor.extract(fp)
+
+                # Write to the template with category-specific mapping
+                out_file = cat_out_dir / f"{fp.stem}_out.xlsx"
+                write_to_template(template_path, template_map, result, out_file, category=cat)
+                emit(f"    Wrote: {out_file.relative_to(out)}\n")
+
+                summary.append({"file": fp.name, "category": cat, "status": "ok", **result})
+                processed_count += 1
+            except Exception as e:
+                emit(f"    ERROR: {e}\n")
+                summary.append({"file": fp.name, "category": cat, "status": "error", "error": str(e)})
 
     # Save a machine-readable run summary
     (out / "summary.json").write_text(json.dumps(summary, indent=2), encoding="utf-8")
