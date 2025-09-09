@@ -159,9 +159,9 @@ def _process_grid(grid: List[List[str]]) -> Optional[Dict[str, Any]]:
     next_col = _next_month_token_col(grid, usd_row, start_col)
     col_start, col_end = start_col, (next_col - 1 if next_col is not None else len(grid[usd_row]) - 1)
 
-    # 5) entity/standardized rows and intersect
-    entity_row = _find_first_in_col(grid, master_col, "ENTITY CODE")
-    std_row = _find_first_in_col(grid, master_col, "Standardized")
+    # 5) classification/standarised rows and intersect
+    entity_row = _find_first_in_col(grid, master_col, "Classification")
+    std_row = _find_first_in_col(grid, master_col, "Standarised")
     if entity_row is None or std_row is None:
         return None
 
@@ -196,7 +196,7 @@ class RWAOpeningExtractor(BaseExtractor):
     - Finds master column by best fuzzy match to the bank name.
     - Detects a month token like "Apr'25" in that column.
     - Uses USD row to locate the token column and the range until the next month token.
-    - Within that range, finds column where (ENTITY CODE == HBME) and (Standardized == RWA).
+    - Within that range, finds column where (Classification == HBME) and (Standarised == RWA).
     - Picks 'Grand Total' row and returns the cell at (grand_total_row, value_col).
     """
 
