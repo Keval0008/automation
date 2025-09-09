@@ -1,5 +1,29 @@
-# map extractor result fields to cells in your output template
+# Map extractor result fields to cells in your output template.
+# You can define a global 'fields' mapping and/or per-category mappings under 'categories'.
+
 fields:
   entity: {sheet: "Summary", cell: "B3"}
   period: {sheet: "Summary", cell: "B4"}
   value:  {sheet: "Summary", cell: "C10"}
+
+categories:
+  frp_rwa:
+    fields:
+      entity: {sheet: "frp_rwa", cell: "B3"}
+      period: {sheet: "frp_rwa", cell: "B4"}
+      value:  {sheet: "frp_rwa", cell: "C10"}
+  frp_pbt:
+    fields:
+      entity: {sheet: "frp_pbt", cell: "B3"}
+      period: {sheet: "frp_pbt", cell: "B4"}
+      value:  {sheet: "frp_pbt", cell: "C10"}
+  growth_rate:
+    fields:
+      entity: {sheet: "growth_rate", cell: "B3"}
+      period: {sheet: "growth_rate", cell: "B4"}
+      value:  {sheet: "growth_rate", cell: "C10"}
+  discount_rate:
+    fields:
+      entity: {sheet: "discount_rate", cell: "B3"}
+      period: {sheet: "discount_rate", cell: "B4"}
+      value:  {sheet: "discount_rate", cell: "C10"}
