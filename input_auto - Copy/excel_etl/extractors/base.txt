@@ -1,12 +1,12 @@
 from abc import ABC, abstractmethod
-from typing import Dict, Any
+from typing import Dict, Any, Optional
 from pathlib import Path
 
 class BaseExtractor(ABC):
     name: str = "base"
 
     @abstractmethod
-    def extract(self, path: Path) -> Dict[str, Any]:
+    def extract(self, path: Path, options: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
         """
         Extract data from the given input file path and return standardized fields.
         """
