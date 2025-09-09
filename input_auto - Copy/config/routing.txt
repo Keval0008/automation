@@ -3,7 +3,10 @@ routes:
   # Route by category (subfolder name under the master input folder)
   - when:
       in_folder: "frp_rwa"
+      filename_contains: "LOB"
     use_extractor: "rwa_opening"
+    options:
+      sheet: "Consolidated"
   - when:
       in_folder: "frp_pbt"
     use_extractor: "rwa_opening"
