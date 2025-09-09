@@ -1,0 +1,30 @@
+from typing import List, Any
+from openpyxl.worksheet.worksheet import Worksheet
+
+def _norm(v: Any) -> str:
+    if v is None:
+        return ""
+    return str(v).strip()
+
+def load_as_grid(ws: Worksheet) -> List[List[str]]:
+    """
+    Read a worksheet into a 2D grid of strings and expand merged cells
+    so every cell in a merged region has the visible value.
+    """
+    max_row = ws.max_row or 0
+    max_col = ws.max_column or 0
+    grid = [["" for _ in range(max_col)] for _ in range(max_row)]
+
+    # fill
+    for r in range(1, max_row + 1):
+        for c in range(1, max_col + 1):
+            grid[r-1][c-1] = _norm(ws.cell(row=r, column=c).value)
+
+    # expand merged
+    for mr in ws.merged_cells.ranges:
+        v = _norm(ws.cell(row=mr.min_row, column=mr.min_col).value)
+        for r in range(mr.min_row, mr.max_row + 1):
+            for c in range(mr.min_col, mr.max_col + 1):
+                grid[r-1][c-1] = v
+
+    return grid

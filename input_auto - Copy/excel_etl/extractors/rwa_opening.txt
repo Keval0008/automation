@@ -1,0 +1,232 @@
+# excel_etl/extractors/rwa_opening.py
+
+from __future__ import annotations
+
+import re
+from difflib import SequenceMatcher
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Tuple, Union
+
+import pandas as pd
+
+from .base import BaseExtractor
+from .registry import register
+from ..utils.readers import read_any
+
+# -------------------- Configuration --------------------
+
+TARGET_BANK = "HSBC BANK MIDDLE EAST LIMITED"
+ENTITY_CODE_VALUE = "HBME"
+STANDARDIZED_VALUE = "RWA"
+CURRENCY_KEY = "USD"
+GRAND_TOTAL_KEY = "Grand Total"
+
+MONTH_TOKEN_RE = re.compile(
+    r"\b(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)'?\d{2}\b",
+    re.IGNORECASE,
+)
+
+# -------------------- Small utilities (kept local to this extractor) --------------------
+
+def _norm(x: Any) -> str:
+    if x is None:
+        return ""
+    s = str(x)
+    return s.strip()
+
+def _df_to_grid(df: pd.DataFrame) -> List[List[str]]:
+    """
+    Convert a DataFrame to a 2D list of strings. Keep all rows/cols.
+    """
+    if df is None or df.shape[0] == 0:
+        return []
+    # Ensure we include all columns; replace NaN with ""
+    filled = df.where(pd.notna(df), None)
+    # Convert to list-of-lists
+    out: List[List[str]] = []
+    for _, row in filled.iterrows():
+        out.append([_norm(v) for v in row.tolist()])
+    return out
+
+def _similar(a: str, b: str) -> float:
+    return SequenceMatcher(None, a.lower(), b.lower()).ratio()
+
+def _find_best_match_col(grid: List[List[str]], target: str) -> int:
+    best_score = -1.0
+    best_col = 0
+    for r, row in enumerate(grid):
+        for c, val in enumerate(row):
+            if not val:
+                continue
+            sc = _similar(val, target)
+            if sc > best_score:
+                best_score = sc
+                best_col = c
+    return best_col
+
+def _find_first_in_col(grid: List[List[str]], col: int, needle: str) -> Optional[int]:
+    nd = needle.lower()
+    for r in range(len(grid)):
+        if col < len(grid[r]) and nd in grid[r][col].lower():
+            return r
+    return None
+
+def _find_first_month_token_in_col(grid: List[List[str]], col: int) -> Optional[Tuple[int, str]]:
+    """
+    Return (row_index, standardized_token like "Apr'25") for first month token found top-down.
+    """
+    for r in range(len(grid)):
+        if col >= len(grid[r]):
+            continue
+        m = MONTH_TOKEN_RE.search(grid[r][col])
+        if m:
+            mon = m.group(1).title()
+            yy = re.findall(r"\d{2}", m.group(0))[0]
+            return r, f"{mon}'{yy}"
+    return None
+
+def _find_token_col_in_row(grid: List[List[str]], row: int, token: str) -> Optional[int]:
+    if row < 0 or row >= len(grid):
+        return None
+    t = token.replace(" ", "").lower()
+    # Exact first
+    for c, val in enumerate(grid[row]):
+        if val.replace(" ", "").lower() == t:
+            return c
+    # Contains as fallback
+    for c, val in enumerate(grid[row]):
+        if t in val.replace(" ", "").lower():
+            return c
+    return None
+
+def _next_month_token_col(grid: List[List[str]], row: int, start_col: int) -> Optional[int]:
+    if row < 0 or row >= len(grid):
+        return None
+    for c in range(start_col + 1, len(grid[row])):
+        if MONTH_TOKEN_RE.search(grid[row][c]):
+            return c
+    return None
+
+def _find_value_col_by_rules(
+    grid: List[List[str]],
+    entity_row: int,
+    std_row: int,
+    col_start: int,
+    col_end: int,
+    entity_code: str = ENTITY_CODE_VALUE,
+    standardized: str = STANDARDIZED_VALUE,
+) -> Optional[int]:
+    # exact match first
+    for c in range(col_start, col_end + 1):
+        e_ok = (c < len(grid[entity_row])) and (grid[entity_row][c].lower() == entity_code.lower())
+        s_ok = (c < len(grid[std_row])) and (grid[std_row][c].lower() == standardized.lower())
+        if e_ok and s_ok:
+            return c
+    # contains fallback
+    for c in range(col_start, col_end + 1):
+        e_ok = (c < len(grid[entity_row])) and (entity_code.lower() in grid[entity_row][c].lower())
+        s_ok = (c < len(grid[std_row])) and (standardized.lower() in grid[std_row][c].lower())
+        if e_ok and s_ok:
+            return c
+    return None
+
+def _process_grid(grid: List[List[str]]) -> Optional[Dict[str, Any]]:
+    """
+    Implements the full extraction flow on a single sheet's grid.
+    Returns a dict with {'entity','period','value'} if successful, else None.
+    """
+    if not grid:
+        return None
+
+    # 1) master column by fuzzy match to bank
+    master_col = _find_best_match_col(grid, TARGET_BANK)
+
+    # 2) first month token in master column
+    mon_hit = _find_first_month_token_in_col(grid, master_col)
+    if not mon_hit:
+        return None
+    _, month_token = mon_hit
+
+    # 3) USD row (in master column)
+    usd_row = _find_first_in_col(grid, master_col, CURRENCY_KEY)
+    if usd_row is None:
+        return None
+
+    # 4) month token column on USD row and compute range
+    start_col = _find_token_col_in_row(grid, usd_row, month_token)
+    if start_col is None:
+        return None
+    next_col = _next_month_token_col(grid, usd_row, start_col)
+    col_start, col_end = start_col, (next_col - 1 if next_col is not None else len(grid[usd_row]) - 1)
+
+    # 5) entity/standardized rows and intersect
+    entity_row = _find_first_in_col(grid, master_col, "ENTITY CODE")
+    std_row = _find_first_in_col(grid, master_col, "Standardized")
+    if entity_row is None or std_row is None:
+        return None
+
+    value_col = _find_value_col_by_rules(
+        grid, entity_row, std_row, col_start, col_end, ENTITY_CODE_VALUE, STANDARDIZED_VALUE
+    )
+    if value_col is None:
+        return None
+
+    # 6) grand total row
+    gt_row = _find_first_in_col(grid, master_col, GRAND_TOTAL_KEY)
+    if gt_row is None:
+        return None
+
+    # 7) cell value
+    if value_col >= len(grid[gt_row]):
+        return None
+    final_value = grid[gt_row][value_col]
+
+    return {
+        "entity": ENTITY_CODE_VALUE,
+        "period": month_token,
+        "value": final_value,
+    }
+
+# -------------------- Extractor --------------------
+
+@register("rwa_opening")
+class RWAOpeningExtractor(BaseExtractor):
+    """
+    RWA Opening extractor
+    - Finds master column by best fuzzy match to the bank name.
+    - Detects a month token like "Apr'25" in that column.
+    - Uses USD row to locate the token column and the range until the next month token.
+    - Within that range, finds column where (ENTITY CODE == HBME) and (Standardized == RWA).
+    - Picks 'Grand Total' row and returns the cell at (grand_total_row, value_col).
+    """
+
+    def extract(self, path: Path) -> Dict[str, Any]:
+        """
+        Read the file (csv/xls/xlsx/xlsb), try each sheet until one yields a result.
+        Uses header=False to keep every row in the grid (important for positional scanning).
+        """
+        data = read_any(path, sheet="*", header=False)  # get all sheets (or entire CSV as one)
+        # CSV case: pandas returns a DataFrame; wrap into dict
+        sheets: Dict[str, pd.DataFrame]
+        if isinstance(data, pd.DataFrame):
+            sheets = {"__csv__": data}
+        else:
+            sheets = data
+
+        last_error: Optional[str] = None
+
+        for sheet_name, df in sheets.items():
+            grid = _df_to_grid(df)
+            try:
+                result = _process_grid(grid)
+                if result:
+                    # you could include the sheet used if helpful
+                    # result["sheet"] = sheet_name
+                    return result
+            except Exception as e:
+                last_error = f"{sheet_name}: {e}"
+
+        # If we reach here, no sheet produced a result
+        if last_error:
+            raise ValueError(f"rwa_opening: no matching layout found. Last error: {last_error}")
+        raise ValueError("rwa_opening: no matching layout found.")

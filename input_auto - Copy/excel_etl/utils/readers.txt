@@ -1,0 +1,150 @@
+from __future__ import annotations
+import pythoncom
+import win32com.client as win32
+import pandas as pd
+from pathlib import Path
+from typing import Dict, Union, Optional, Literal
+
+# ---------- helpers ----------
+
+def _sidecar_password(path: Path) -> Optional[str]:
+    """
+    If a file has a password, expect a sibling .txt with the same stem.
+    Returns first line stripped, or None.
+    """
+    pw_file = path.with_suffix(".txt")
+    if pw_file.exists():
+        try:
+            return pw_file.read_text(encoding="utf-8").splitlines()[0].strip()
+        except Exception:
+            return None
+    return None
+
+def _values_to_df(values, header: bool = True) -> pd.DataFrame:
+    """
+    Normalize COM 'UsedRange.Value' into a pandas DataFrame.
+    """
+    if values is None:
+        return pd.DataFrame()
+
+    # Normalize to list of rows
+    if not isinstance(values, (list, tuple)):
+        values = [[values]]
+    elif isinstance(values, tuple):
+        values = [list(r) if isinstance(r, (list, tuple)) else [r] for r in values]
+    else:
+        values = [list(r) if isinstance(r, (list, tuple)) else [r] for r in values]
+
+    # make rows same length
+    max_len = max((len(r) for r in values), default=0)
+    norm_rows = []
+    for r in values:
+        if len(r) < max_len:
+            r = list(r) + [None] * (max_len - len(r))
+        norm_rows.append(r)
+
+    if header and len(norm_rows) >= 1:
+        cols = [str(c) if c is not None else f"col_{i+1}" for i, c in enumerate(norm_rows[0])]
+        df = pd.DataFrame(norm_rows[1:], columns=cols)
+    else:
+        df = pd.DataFrame(norm_rows)
+    return df
+
+# ---------- COM reader ----------
+
+def _read_excel_via_com(
+    path: Path,
+    open_password: Optional[str],
+    sheet: Union[str, int, None, Literal["*"]] = None,
+    header: bool = True,
+) -> Union[pd.DataFrame, Dict[str, pd.DataFrame]]:
+    """
+    Read Excel using COM (best for encrypted or xlsb/xls quirks).
+    Returns a DataFrame or dict of {sheet_name: DataFrame} if sheet="*".
+    """
+    pythoncom.CoInitialize()
+    excel = win32.gencache.EnsureDispatch("Excel.Application")
+    excel.Visible = False
+    excel.DisplayAlerts = False
+    wb = None
+    try:
+        wb = excel.Workbooks.Open(
+            str(path),
+            UpdateLinks=0,
+            ReadOnly=True,
+            Password=open_password or None,
+            WriteResPassword=None,
+            IgnoreReadOnlyRecommended=True,
+        )
+
+        def get_ws(target):
+            if target is None:
+                return wb.Worksheets(1)
+            if target == "*":
+                return [wb.Worksheets(i) for i in range(1, wb.Worksheets.Count + 1)]
+            if isinstance(target, int):
+                return wb.Worksheets(int(target))
+            return wb.Worksheets(target)  # by name
+
+        if sheet == "*":
+            out = {}
+            for i in range(1, wb.Worksheets.Count + 1):
+                ws = wb.Worksheets(i)
+                used = ws.UsedRange
+                df = _values_to_df(used.Value, header=header)
+                out[ws.Name] = df
+            return out
+        else:
+            ws = get_ws(sheet)
+            used = ws.UsedRange
+            return _values_to_df(used.Value, header=header)
+    finally:
+        if wb is not None:
+            wb.Close(SaveChanges=False)
+        excel.Quit()
+        pythoncom.CoUninitialize()
+
+# ---------- public API ----------
+
+def read_any(
+    path: Union[str, Path],
+    sheet: Union[str, int, None, Literal["*"]] = None,  # None=first, str=name, int=index(1-based), "*"=all
+    header: bool = True,
+) -> Union[pd.DataFrame, Dict[str, pd.DataFrame]]:
+    """
+    Unified reader for CSV / XLSX / XLSB / XLS, with password sidecar support.
+    - CSV: pandas.read_csv
+    - Excel (all): try COM first (honors sidecar password), fallback to pandas engines.
+
+    Returns DataFrame or dict of {sheet_name: DataFrame} if sheet="*".
+    """
+    p = Path(path)
+    ext = p.suffix.lower()
+
+    # CSV straight via pandas
+    if ext == ".csv":
+        return pd.read_csv(p, header=0 if header else None)
+
+    # Excel types
+    open_password = _sidecar_password(p)
+
+    # Try COM first (handles passwords and odd formats well)
+    try:
+        return _read_excel_via_com(p, open_password=open_password, sheet=sheet, header=header)
+    except Exception:
+        # Fallbacks: best-effort when COM not available or fails
+        if ext == ".xlsb":
+            # pyxlsb engine reads data but no formulas; header handling via pandas
+            if sheet == "*":
+                # read all sheets
+                x = pd.ExcelFile(p, engine="pyxlsb")
+                return {sn: pd.read_excel(x, sheet_name=sn, engine="pyxlsb", header=0 if header else None) for sn in x.sheet_names}
+            else:
+                return pd.read_excel(p, sheet_name=sheet or 0, engine="pyxlsb", header=0 if header else None)
+        else:
+            # xlsx/xls fallback with openpyxl/xlrd if available; passwords NOT supported here
+            if sheet == "*":
+                x = pd.ExcelFile(p)  # auto engine
+                return {sn: pd.read_excel(x, sheet_name=sn, header=0 if header else None) for sn in x.sheet_names}
+            else:
+                return pd.read_excel(p, sheet_name=sheet or 0, header=0 if header else None)

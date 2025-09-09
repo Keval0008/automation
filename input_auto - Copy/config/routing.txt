@@ -1,0 +1,8 @@
+# Route common spreadsheet and CSV files to the rwa_opening extractor
+routes:
+  - when:
+      filename_regex: "(?i).*\\.(xlsx|xls|xlsb|csv)$"
+    use_extractor: "rwa_opening"
+
+# Fallback extractor if no explicit route matches
+default_extractor: "rwa_opening"

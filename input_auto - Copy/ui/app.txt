@@ -1,0 +1,145 @@
+import os
+import sys
+import threading
+import queue
+from pathlib import Path
+from tkinter import Tk, StringVar, ttk, filedialog, messagebox
+
+# business logic
+from excel_etl.runner import run_batch
+
+class ExcelToolApp:
+    def __init__(self, root: Tk):
+        self.root = root
+        self.root.title("Excel Population Tool")
+        self.root.geometry("760x520")
+
+        self.input_dir = StringVar()
+        self.output_dir = StringVar()
+        self.template_file = StringVar()
+        self.status = StringVar(value="Idle")
+
+        self.log_queue = queue.Queue()
+        self._build_ui()
+        self._pump_logs()
+
+    def _build_ui(self):
+        pad = {"padx": 10, "pady": 6}
+        frm = ttk.Frame(self.root)
+        frm.pack(fill="both", expand=True)
+
+        # Input folder
+        row = ttk.Frame(frm); row.pack(fill="x", **pad)
+        ttk.Label(row, text="Input Folder:").pack(side="left")
+        ttk.Entry(row, textvariable=self.input_dir).pack(side="left", fill="x", expand=True, padx=8)
+        ttk.Button(row, text="Browse", command=self._choose_input).pack(side="left")
+
+        # Output folder
+        row = ttk.Frame(frm); row.pack(fill="x", **pad)
+        ttk.Label(row, text="Output Folder:").pack(side="left")
+        ttk.Entry(row, textvariable=self.output_dir).pack(side="left", fill="x", expand=True, padx=8)
+        ttk.Button(row, text="Browse", command=self._choose_output).pack(side="left")
+
+        # Template file
+        row = ttk.Frame(frm); row.pack(fill="x", **pad)
+        ttk.Label(row, text="Template (.xlsx):").pack(side="left")
+        ttk.Entry(row, textvariable=self.template_file).pack(side="left", fill="x", expand=True, padx=8)
+        ttk.Button(row, text="Browse", command=self._choose_template).pack(side="left")
+
+        # Controls
+        row = ttk.Frame(frm); row.pack(fill="x", **pad)
+        self.btn = ttk.Button(row, text="Populate", command=self._on_run)
+        self.btn.pack(side="left")
+        ttk.Button(row, text="Open Output Folder", command=self._open_output).pack(side="left", padx=8)
+
+        # Progress + status
+        row = ttk.Frame(frm); row.pack(fill="x", **pad)
+        self.pbar = ttk.Progressbar(row, mode="indeterminate")
+        self.pbar.pack(side="left", fill="x", expand=True)
+        ttk.Label(row, textvariable=self.status).pack(side="left", padx=10)
+
+        # Log
+        ttk.Label(frm, text="Log:").pack(anchor="w", padx=10, pady=(12, 0))
+        self.log = ttk.Treeview(frm, show="", height=12)
+        self.log.pack(fill="both", expand=True, padx=10, pady=(0, 10))
+        self.log["columns"] = ("log",)
+        self.log.column("#0", width=0, stretch=False)
+        self.log.column("log", anchor="w", width=720)
+
+    def _choose_input(self):
+        p = filedialog.askdirectory(title="Select input folder")
+        if p: self.input_dir.set(p)
+
+    def _choose_output(self):
+        p = filedialog.askdirectory(title="Select output folder")
+        if p: self.output_dir.set(p)
+
+    def _choose_template(self):
+        p = filedialog.askopenfilename(title="Select template .xlsx", filetypes=[("Excel", "*.xlsx")])
+        if p: self.template_file.set(p)
+
+    def _append_log(self, text: str):
+        self.log.insert("", "end", values=(text,))
+
+    def _pump_logs(self):
+        try:
+            while True:
+                msg = self.log_queue.get_nowait()
+                if msg == "__DONE__":
+                    self.pbar.stop()
+                    self.btn.config(state="normal")
+                    self.status.set("Finished")
+                    messagebox.showinfo("Done", "Population completed.")
+                else:
+                    self._append_log(msg)
+        except queue.Empty:
+            pass
+        self.root.after(100, self._pump_logs)
+
+    def _on_run(self):
+        if not Path(self.input_dir.get()).is_dir():
+            messagebox.showerror("Error", "Please select a valid Input Folder."); return
+        if not Path(self.output_dir.get()).is_dir():
+            messagebox.showerror("Error", "Please select a valid Output Folder."); return
+        if not Path(self.template_file.get()).is_file():
+            messagebox.showerror("Error", "Please select a valid Template (.xlsx)."); return
+
+        self.btn.config(state="disabled")
+        self.pbar.start(12)
+        self.status.set("Running...")
+        for row_id in self.log.get_children(): self.log.delete(row_id)
+
+        t = threading.Thread(
+            target=self._worker,
+            args=(self.input_dir.get(), self.output_dir.get(), self.template_file.get()),
+            daemon=True
+        )
+        t.start()
+
+    def _worker(self, input_dir: str, output_dir: str, template_path: str):
+        try:
+            def log_cb(msg: str): self.log_queue.put(msg.rstrip("\n"))
+            run_batch(input_dir=input_dir, out_dir=output_dir, template_path=template_path, log_cb=log_cb)
+            self.log_queue.put("__DONE__")
+        except Exception as e:
+            self.log_queue.put(f"ERROR: {e}")
+            self.log_queue.put("__DONE__")
+
+    def _open_output(self):
+        out = self.output_dir.get()
+        if not out: 
+            messagebox.showinfo("Info", "Select an Output Folder first."); return
+        try:
+            if sys.platform.startswith("win"):
+                os.startfile(out)  # type: ignore
+            elif sys.platform == "darwin":
+                os.system(f'open "{out}"')
+            else:
+                os.system(f'xdg-open "{out}"')
+        except Exception as e:
+            messagebox.showerror("Error", f"Could not open folder:\n{e}")
+
+if __name__ == "__main__":
+    root = Tk()
+    app = ExcelToolApp(root)
+    root.mainloop()

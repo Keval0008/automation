@@ -1,0 +1,2 @@
+# ensure extractors are import-registered here as needed
+from . import rwa_opening  # noqa: F401

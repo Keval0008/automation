@@ -1,0 +1,5 @@
+# map extractor result fields to cells in your output template
+fields:
+  entity: {sheet: "Summary", cell: "B3"}
+  period: {sheet: "Summary", cell: "B4"}
+  value:  {sheet: "Summary", cell: "C10"}

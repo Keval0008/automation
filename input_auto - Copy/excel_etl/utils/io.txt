@@ -1,0 +1,13 @@
+from pathlib import Path
+from typing import Dict, Any
+from openpyxl import load_workbook
+
+def write_to_template(template_path: str, template_map: dict, data: Dict[str, Any], out_path: Path):
+    wb = load_workbook(template_path)
+    for field, loc in template_map.get("fields", {}).items():
+        if field not in data:
+            continue
+        ws = wb[loc["sheet"]]
+        ws[loc["cell"]] = data[field]
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    wb.save(out_path)

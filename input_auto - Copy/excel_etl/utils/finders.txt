@@ -1,0 +1,2 @@
+# placeholder module for future shared finders (regexes, fuzzy match, etc.)
+# we’ll fill as your extractors need them.
