@@ -225,8 +225,8 @@ class RWAOpeningExtractor(BaseExtractor):
             try:
                 result = _process_grid(grid)
                 if result:
-                    # you could include the sheet used if helpful
-                    # result["sheet"] = sheet_name
+                    # include the sheet used
+                    result["sheet"] = str(target_sheet) if target_sheet is not None else sheet_name
                     return result
             except Exception as e:
                 last_error = f"{sheet_name}: {e}"
