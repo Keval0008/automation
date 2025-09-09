@@ -5,7 +5,7 @@ from __future__ import annotations
 import re
 import json
 from pathlib import Path
-from typing import Callable, Optional, List
+from typing import Callable, Optional, List, Tuple, Dict, Any
 
 import yaml
 
@@ -28,7 +28,7 @@ def _load_yaml(relpath: str) -> dict:
     return yaml.safe_load(resource_path(relpath).read_text(encoding="utf-8"))
 
 
-def _choose_extractor(path: Path, routing_cfg: dict, category: Optional[str] = None) -> Optional[str]:
+def _choose_extractor(path: Path, routing_cfg: dict, category: Optional[str] = None) -> Tuple[Optional[str], Dict[str, Any]]:
     """
     Decide which extractor to use for a given input file based on routing rules.
     Current rules support filename_regex; extend as needed.
@@ -46,12 +46,16 @@ def _choose_extractor(path: Path, routing_cfg: dict, category: Optional[str] = N
         if "filename_regex" in cond:
             ok &= bool(re.match(cond["filename_regex"], fname, flags=re.IGNORECASE))
 
+        # filename contains (case-insensitive)
+        if "filename_contains" in cond:
+            ok &= (cond["filename_contains"].lower() in fname.lower())
+
         # future: add sheet_contains, etc.
 
         if ok:
-            return rule["use_extractor"]
+            return rule["use_extractor"], dict(rule.get("options", {}))
 
-    return routing_cfg.get("default_extractor")
+    return routing_cfg.get("default_extractor"), {}
 
 
 def _gather_input_files(in_dir: Path, exts: List[str]) -> List[Path]:
@@ -139,7 +143,7 @@ def run_batch(
             emit(f"  [{i}/{len(files)}] {fp.name}\n")
             try:
                 # Pick extractor by routing rules
-                ex_name = _choose_extractor(fp, routing_cfg, category=cat)
+                ex_name, ex_opts = _choose_extractor(fp, routing_cfg, category=cat)
                 if not ex_name:
                     emit("    No extractor matched. Skipping.\n")
                     summary.append({"file": fp.name, "category": cat, "status": "skipped"})
@@ -150,7 +154,7 @@ def run_batch(
                 emit(f"    Using extractor: {ex_name}\n")
 
                 # IMPORTANT: pass the file path; extractor reads via readers.read_any()
-                result = extractor.extract(fp)
+                result = extractor.extract(fp, options=ex_opts)
 
                 # Write to the template with category-specific mapping
                 out_file = cat_out_dir / f"{fp.stem}_out.xlsx"
