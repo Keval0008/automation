@@ -200,12 +200,17 @@ class RWAOpeningExtractor(BaseExtractor):
     - Picks 'Grand Total' row and returns the cell at (grand_total_row, value_col).
     """
 
-    def extract(self, path: Path) -> Dict[str, Any]:
+    def extract(self, path: Path, options: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
         """
         Read the file (csv/xls/xlsx/xlsb), try each sheet until one yields a result.
         Uses header=False to keep every row in the grid (important for positional scanning).
         """
-        data = read_any(path, sheet="*", header=False)  # get all sheets (or entire CSV as one)
+        target_sheet: Optional[Union[str, int]] = None
+        if options and isinstance(options.get("sheet"), (str, int)):
+            target_sheet = options["sheet"]
+
+        # If a sheet is specified, read only that sheet; else read all
+        data = read_any(path, sheet=(target_sheet if target_sheet is not None else "*"), header=False)
         # CSV case: pandas returns a DataFrame; wrap into dict
         sheets: Dict[str, pd.DataFrame]
         if isinstance(data, pd.DataFrame):
