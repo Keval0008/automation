@@ -1,5 +1,20 @@
 # Route common spreadsheet and CSV files to the rwa_opening extractor
 routes:
+  # Route by category (subfolder name under the master input folder)
+  - when:
+      in_folder: "frp_rwa"
+    use_extractor: "rwa_opening"
+  - when:
+      in_folder: "frp_pbt"
+    use_extractor: "rwa_opening"
+  - when:
+      in_folder: "growth_rate"
+    use_extractor: "rwa_opening"
+  - when:
+      in_folder: "discount_rate"
+    use_extractor: "rwa_opening"
+
+  # Fallback: any spreadsheet/CSV file
   - when:
       filename_regex: "(?i).*\\.(xlsx|xls|xlsb|csv)$"
     use_extractor: "rwa_opening"
