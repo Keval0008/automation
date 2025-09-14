@@ -1,48 +1,77 @@
-def sheet_Manual_Adjustments_Mn_LCY(ctx: Mapping[str, pd.DataFrame]) -> pd.DataFrame:
+def sheet_tangible_equity(ctx: Mapping[str, pd.DataFrame]) -> pd.DataFrame:
     """
-    Build 'Manual_Adjustments(Mn LCY)' from user_input + derived rollup and years.
-
-    Steps:
-      1) entity from user_input['entity']
-      2) cgu list from cgu_rollup (both LHS and RHS)
-      3) years list from current_year/testing_date + look_ahead
-      4) adj_list = ['RWA','PBT','Free_Cash_Flows','CET1']
-      5) Output rows = cartesian product of CGUs x adj_list, with zeros for Opening and each year.
+    Builds the 'tangible_equity' sheet from:
+      - ctx['tangible_equity'] -> sheet 'ROTE Detail Valued' (in 'tangible_equity' folder, key 'RoTE')
+      - ctx['user_input'] -> sheet 'user_input'
+    Logic:
+      entity from user_input; CGUs from cgu_rollup; for each CGU find its 'Spot' TE column
+      and take value on the entity row. Also computes global te_ratio.
     """
-    import itertools
+    import numpy as np
     import pandas as pd
-    from utility import ui_to_kv, parse_cgu_rollup, derive_years_from_ui_kv
+    from utility import ui_to_kv, parse_cgu_rollup
 
+    te_input_df = ctx["tangible_equity"]
     ui = ctx["user_input"]
     kv = ui_to_kv(ui)
 
-    # 1) entity
     entity = str(kv.get("entity", "")).strip()
-
-    # 2) cgu list from rollup
     rollup_expr = kv.get("cgu_rollup") or kv.get("cgu_rollups") or ""
-    cgus = parse_cgu_rollup(rollup_expr)
+    cgus = parse_cgu_rollup(rollup_expr)  # e.g. ['Total','CIB','IWPB','CC']
 
-    # 3) years
-    years = derive_years_from_ui_kv(kv)  # list[int]
+    # String view for matching
+    te_str = te_input_df.copy().applymap(lambda x: str(x).strip() if pd.notna(x) else "")
 
-    # 4) adjustment types
-    adj_list = ["RWA", "PBT", "Free_Cash_Flows", "CET1"]
+    # --- find entity row anywhere in the sheet ---
+    pos_entity = np.argwhere(te_str.values == entity)
+    if pos_entity.size == 0:
+        # case-insensitive fallback
+        pos_entity = np.argwhere(np.vectorize(lambda x: x.lower() == entity.lower())(te_str.values))
+    if pos_entity.size == 0:
+        raise ValueError(f"Entity '{entity}' not found in tangible_equity sheet.")
+    entity_row_idx = int(pos_entity[0][0])  # we only need the row index
 
-    # 5) build cartesian product
-    rows = []
-    for cgu, adj in itertools.product(cgus, adj_list):
-        row = {
-            "entity": entity,
-            "business_line": cgu,
-            "adj_type": adj,
-            "Opening": 0.0,
-        }
-        for y in years:
-            row[y] = 0.0
-        rows.append(row)
+    # Helper to find first occurrence of a label anywhere; returns (row, col)
+    def find_label(label: str) -> tuple[int, int]:
+        hits = np.argwhere(te_str.values == label)
+        if hits.size:
+            return int(hits[0][0]), int(hits[0][1])
+        # case-insensitive fallback
+        hits = np.argwhere(np.vectorize(lambda x: x.lower() == label.lower())(te_str.values))
+        if hits.size:
+            return int(hits[0][0]), int(hits[0][1])
+        raise ValueError(f"Label '{label}' not found in tangible_equity sheet.")
 
-    # consistent column order: entity, business_line, adj_type, Opening, years...
-    cols = ["entity", "business_line", "adj_type", "Opening"] + years
-    df_out = pd.DataFrame(rows, columns=cols)
-    return df_out
+    # Numeric parser that tolerates strings and percents
+    def to_float(x) -> float:
+        if pd.isna(x):
+            return 0.0
+        s = str(x).strip()
+        if s == "":
+            return 0.0
+        if s.endswith("%"):
+            try:
+                return float(s[:-1]) / 100.0
+            except Exception:
+                return 0.0
+        try:
+            return float(s)
+        except Exception:
+            return 0.0
+
+    output_dict = {"entity": entity}
+
+    for cgu in cgus:
+        cgu_new = "Corp Centre" if cgu == "CC" else cgu
+        variable = "Spot TE" if cgu_new == "Total" else f"{cgu_new} TE Spot"
+        _r, cgu_col_idx = find_label(variable)  # we only need the column index
+        output_dict[cgu] = to_float(te_input_df.iat[entity_row_idx, cgu_col_idx])
+
+    # Compute global te_ratio as requested
+    total_val = output_dict.get("Total", 0.0) or 0.0
+    global te_ratio  # noqa: PLW0603 – explicit global per your spec
+    te_ratio = {k: (v / total_val if total_val else 0.0)
+                for k, v in output_dict.items()
+                if k not in ("entity",)}
+
+    return pd.DataFrame([output_dict], columns=["entity"] + cgus)
