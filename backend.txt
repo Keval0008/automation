@@ -1,209 +1,164 @@
-
-# backend.py
-from __future__ import annotations
-from pathlib import Path
-from typing import Callable, Dict, Mapping, Optional, List, Union
-import pandas as pd
-
-from utility import (
-    PipelineConfig, InputSpec,
-    discover_files, pick_file_by_keyword, read_tablelike_any, pick_sheet,
-    ensure_columns, vlookup_merge, coalesce, safe_cast,
-    PasswordProvider, ProgressReporter, write_output_excel
-)
-
-# ----- Load inputs -----
-
-def load_context(
-    cfg: PipelineConfig,
-    inputs: List[InputSpec],
-    password_provider: Optional[PasswordProvider] = None,
-    report: Optional[ProgressReporter] = None,
-) -> Dict[str, pd.DataFrame]:
-    ctx: Dict[str, pd.DataFrame] = {}
-    for spec in inputs:
-        files = discover_files(cfg, subfolder=spec.subfolder)
-        found = pick_file_by_keyword(files, spec.keyword, cfg.case_insensitive, cfg.multi_match_policy)
-        if not found:
-            if cfg.strict_inputs:
-                raise FileNotFoundError(f"No file found for keyword '{spec.keyword}' in subfolder='{spec.subfolder or '*'}'")
-            else:
-                if report: report(f"Skipped: no file for keyword '{spec.keyword}'")
-                continue
-        if report: report(f"Reading: {found.name}")
-        dfs = read_tablelike_any(found, sheet_name=None if spec.sheet_name is None else spec.sheet_name, password=spec.password, password_provider=password_provider, report=report)
-        df = pick_sheet(dfs, spec.sheet_name)
-        ctx[spec.logical_name] = df
-        if report: report(f"Loaded: {spec.logical_name} ({df.shape[0]} rows, {df.shape[1]} cols)")
-    return ctx
-
-# ----- Build outputs (sheet logic lives here) -----
-
-def build_output(sheet_funcs: Mapping[str, Callable[[Mapping[str, pd.DataFrame]], pd.DataFrame]], ctx: Mapping[str, pd.DataFrame], report: Optional[ProgressReporter] = None) -> Dict[str, pd.DataFrame]:
-    out: Dict[str, pd.DataFrame] = {}
-    for name, fn in sheet_funcs.items():
-        if report: report(f"Building sheet: {name}")
-        df = fn(ctx)  # Each sheet function written here
-        if not isinstance(df, pd.DataFrame):
-            raise TypeError(f"Sheet function '{name}' must return a pandas DataFrame, got {type(df)}")
-        out[name] = df
-        if report: report(f"Built: {name} ({df.shape[0]} rows, {df.shape[1]} cols)")
-    return out
-
-# Example placeholder sheet function — replace with your real rules per sheet
 def sheet_Discount_rate(ctx: Mapping[str, pd.DataFrame]) -> pd.DataFrame:
     """
-    Builds the "Discount_rate" sheet from the discount_rate workbook using the following rules:
+    Output sheet: "Discount_rate"
 
-    Inputs expected in ctx:
-      - "discount_rate": DataFrame of the CoE rate matrix (searchable grid, not strict columns).
-      - "user_input": DataFrame with columns ["Field","Value"] (sheet "user_input").
-
-    Logic:
-      1) Find the cell containing "Entity" -> (RN1, CN1).
-      2) On row (RN1 - 1), read the CGU headers. Limit to those appearing in the user's cgu_rollup from user_input
-         (e.g., "Total=CIB+IWPB+CC"). We accept ["Group","IWPB","CIB","CC"] as valid headers and map "Group"->"Total".
-      3) Within the column range spanning those CGU headers, on row RN1 look for cells == "CoE LCY".
-         Each "CoE LCY" column under a CGU header is the value column for that CGU.
-      4) In column CN1 (Entity column), find the row whose text matches the location label
-         "HBME - United Arab Emirates" (via helper_config) OR, if not found, the final entity name from user_input.
-      5) For each CGU's value column + the found row, fetch the value. If a CGU from rollup is missing, fill 0.
-      6) Return one-row DataFrame with columns: entity, Total, CC, CIB, IWPB.
+    Steps:
+      1) Find cell "Entity" => (RN1, CN1)
+      2) On row RN1-1, treat each CGU header (Group/IWPB/CIB/CC) as a span that
+         runs until the next header appears.
+      3) For each CGU span, on RN1 look for a cell containing "CoE LCY" (case-insensitive).
+         That column is the value column for that CGU.
+      4) In CN1, find the row for location/entity and read the values.
+      5) Return one-row DF: entity, Total, CC, CIB, IWPB (fill 0 when missing).
     """
+    import re
+    import numpy as np
+    import pandas as pd
+
     dr = ctx["discount_rate"]
     ui = ctx["user_input"]
 
-    # Helper config: mapping and normalization
-    helper_config = {"discount_rate": {"HBME - United Arab Emirates":"5300_1GRT - HSBC Bank Middle East","Group":"Total"}}
-    cgu_header_map = {"Group": "Total", "IWPB": "IWPB", "CIB": "CIB", "CC": "CC"}
+    # ---- helpers / config ----
+    helper_config = {
+        "discount_rate": {
+            "HBME - United Arab Emirates": "5300_1GRT - HSBC Bank Middle East",
+            "Group": "Total",
+        }
+    }
+    # header normalization (case-insensitive)
+    cgu_header_map = {"group": "Total", "iwpb": "IWPB", "cib": "CIB", "cc": "CC"}
+    wanted_keys = ["Total", "CIB", "IWPB", "CC"]
 
-    # Extract user_input values
-    if not {"Field","Value"}.issubset(ui.columns):
+    # ---- user_input: entity + rollup ----
+    if not {"Field", "Value"}.issubset(ui.columns):
         raise KeyError("user_input must have columns ['Field','Value']")
     kv = {str(k).strip(): v for k, v in zip(ui["Field"], ui["Value"])}
     entity_name = str(kv.get("entity", "")).strip()
-    rollup_expr = str(kv.get("cgu_rollup", "")).strip() or str(kv.get("cgu_rollups", "")).strip()
+    rollup_expr = str(kv.get("cgu_rollup", "") or kv.get("cgu_rollups", "")).strip()
 
-    # Parse rollup like "Total=CIB+IWPB+CC"
-    import re as _re
-    rollup_targets = []
+    # include both LHS and RHS of '='; normalize via cgu_header_map and dedupe
+    def norm(label: str) -> str:
+        return cgu_header_map.get(label.strip().lower(), label.strip())
+
+    rollup_targets: list[str]
     if "=" in rollup_expr:
         left, right = rollup_expr.split("=", 1)
-        rollup_targets = [left.strip()] + [x.strip() for x in _re.split(r"[+]", right) if x.strip()]
-
-        # Map to logical names
-        rollup_targets = list(dict.fromkeys([cgu_header_map.get(x, x) for x in rollup_targets]))
-        # Include 'Total' explicitly if left corresponds to Group/Total
-        left_norm = cgu_header_map.get(left, left)
-        if left_norm not in rollup_targets:
-            rollup_targets.insert(0, left_norm)
+        rhs = [x.strip() for x in re.split(r"[+]", right) if x.strip()]
+        rollup_targets = [norm(left)] + [norm(x) for x in rhs]
     else:
-        rollup_targets = ["Total","CIB","IWPB","CC"]
+        rollup_targets = [norm(x) for x in re.split(r"[+]", rollup_expr) if x.strip()]
+    # default if parsing empty/failed
+    if not rollup_targets:
+        rollup_targets = wanted_keys.copy()
 
-    # Normalize discount_rate to string for matching
-    import pandas as _pd
-    dr_str = dr.copy().applymap(lambda x: str(x).strip() if _pd.notna(x) else "")
+    # de-duplicate preserving order, and keep only known keys
+    seen = set()
+    rollup_targets = [x for x in rollup_targets if not (x in seen or seen.add(x)) and x in wanted_keys]
 
-    # 1) Find "Entity"
-    import numpy as _np
-    matches = _np.argwhere((dr_str.values == "Entity"))
-    if matches.size == 0:
-        # case-insensitive
-        matches = _np.argwhere(_np.vectorize(lambda x: x.lower() == "entity")(dr_str.values))
-    if matches.size == 0:
-        raise ValueError("Could not find 'Entity' cell in discount_rate sheet")
-    RN1, CN1 = matches[0].tolist()
+    # ---- cast to strings for scanning ----
+    dr_str = dr.copy().applymap(lambda x: str(x).strip() if pd.notna(x) else "")
 
-    # 2) CGU headers row
+    # 1) locate "Entity" (case-insensitive, substring not required here)
+    pos = np.argwhere(dr_str.values == "Entity")
+    if pos.size == 0:
+        pos = np.argwhere(np.vectorize(lambda x: x.lower() == "entity")(dr_str.values))
+    if pos.size == 0:
+        raise ValueError("Could not find 'Entity' cell")
+    RN1, CN1 = pos[0].tolist()
+
+    # 2) build CGU spans from header row RN1-1
     header_row_idx = RN1 - 1
     if header_row_idx < 0:
-        raise ValueError("Header row (RN1-1) invalid")
-    header_row = dr_str.iloc[header_row_idx, :]
-    cgu_cols = {}
-    for col_idx, val in enumerate(header_row.values.tolist()):
-        if val in cgu_header_map:
-            cgu_cols[col_idx] = cgu_header_map[val]
-    # filter by rollup
-    cgu_cols = {c: name for c, name in cgu_cols.items() if name in set(rollup_targets + ["Total"])}
-    if not cgu_cols:
-        raise ValueError("No CGU headers found in header row for requested rollup")
+        raise ValueError("Invalid layout: header row is above the sheet start")
 
-    col_min, col_max = min(cgu_cols), max(cgu_cols)
+    header_row = dr_str.iloc[header_row_idx, :].tolist()
+    starts: list[tuple[int, str]] = []  # (col_index, logical_cgu)
+    for j, raw in enumerate(header_row):
+        key = raw.strip().lower()
+        if key in cgu_header_map:
+            starts.append((j, cgu_header_map[key]))
+    if not starts:
+        raise ValueError("No CGU headers (Group/IWPB/CIB/CC) found on RN1-1")
 
-    # 3) Pick columns on RN1 labeled 'CoE LCY'
+    # create spans: each header runs until the next header (exclusive)
+    max_col = dr_str.shape[1] - 1
+    spans: dict[str, range] = {}  # logical -> range(start, end_inclusive+1)
+    for idx, (start_col, logical) in enumerate(starts):
+        end_col = (starts[idx + 1][0] - 1) if idx + 1 < len(starts) else max_col
+        spans[logical] = range(start_col, end_col + 1)
+
+    # restrict to requested rollup targets (but ensure 'Total' is included if present)
+    spans = {k: v for k, v in spans.items() if k in set(rollup_targets + ["Total"])}
+
+    # 3) within each span, on RN1, find a column whose cell contains "CoE LCY"
     rn1_row = dr_str.iloc[RN1, :]
-    value_cols = {}
-    for c in range(col_min, col_max + 1):
-        if rn1_row.iat[c] == "CoE LCY":
-            logical = cgu_cols.get(c)
-            if logical:
-                value_cols[logical] = c
-    if not value_cols:
-        raise ValueError("No 'CoE LCY' columns under CGU headers in the expected range")
+    value_cols: dict[str, int] = {}
+    for logical, rng in spans.items():
+        chosen = None
+        for c in rng:
+            cell_val = str(rn1_row.iat[c]).strip().lower()
+            if "coe lcy" in cell_val:
+                chosen = c
+                break  # first match in span
+        if chosen is not None:
+            value_cols[logical] = chosen
+        # if not found, we leave it absent for now (will default to 0 later)
 
-    # 4) Find entity row from CN1
+    if not value_cols:
+        raise ValueError("No 'CoE LCY' columns found (substring search within CGU spans)")
+
+    # 4) find entity row in the 'Entity' column (CN1)
     loc_map = helper_config.get("discount_rate", {})
-    # Prefer mapped location for entity
-    location_label = None
-    for loc, ent in loc_map.items():
-        if ent == entity_name:
-            location_label = loc
-            break
-    if location_label is None:
-        location_label = next(iter(loc_map.keys()), None)
+    # prefer mapped location whose value==entity
+    location_label = next((loc for loc, ent in loc_map.items() if ent == entity_name), None)
+    # fallback to a known default location if provided
+    if location_label is None and "HBME - United Arab Emirates" in loc_map:
+        location_label = "HBME - United Arab Emirates"
 
     entity_col = dr_str.iloc[:, CN1]
     entity_row_idx = None
     if location_label:
-        idxs = entity_col[entity_col == location_label].index.tolist()
-        if idxs:
-            entity_row_idx = idxs[0]
+        hits = entity_col[entity_col.str.lower() == location_label.lower()].index.tolist()
+        if hits:
+            entity_row_idx = hits[0]
     if entity_row_idx is None and entity_name:
-        idxs = entity_col[entity_col == entity_name].index.tolist()
-        if idxs:
-            entity_row_idx = idxs[0]
+        hits = entity_col[entity_col.str.lower() == entity_name.lower()].index.tolist()
+        if hits:
+            entity_row_idx = hits[0]
     if entity_row_idx is None:
         raise ValueError("Could not find the specified location/entity in the Entity column")
 
     final_entity = loc_map.get(location_label, entity_name) or entity_col.iat[entity_row_idx]
 
-    # 5) Gather values
+    # 5) fetch values per CGU (default 0 if no CoE LCY found in its span)
     out_vals = {"Total": 0.0, "CC": 0.0, "CIB": 0.0, "IWPB": 0.0}
-    for logical, col_idx in value_cols.items():
+    for logical in out_vals.keys():
+        col_idx = value_cols.get(logical)
+        if col_idx is None:
+            continue
         raw = dr.iloc[entity_row_idx, col_idx]
+        val = 0.0
         try:
             val = float(raw)
         except Exception:
             s = str(raw).strip()
             if s.endswith("%"):
-                try: val = float(s[:-1]) / 100.0
-                except: val = 0.0
+                try:
+                    val = float(s[:-1]) / 100.0
+                except Exception:
+                    val = 0.0
             else:
-                try: val = float(s)
-                except: val = 0.0
+                try:
+                    val = float(s)
+                except Exception:
+                    val = 0.0
         out_vals[logical] = val
 
-    # Compose final DataFrame
-    df_out = _pd.DataFrame([{
+    # assemble one-row output
+    return pd.DataFrame([{
         "entity": final_entity,
         "Total": out_vals.get("Total", 0.0),
         "CC": out_vals.get("CC", 0.0),
         "CIB": out_vals.get("CIB", 0.0),
         "IWPB": out_vals.get("IWPB", 0.0),
-    }])[["entity","Total","CC","CIB","IWPB"]]
-    return df_out
-
-# ----- Entrypoint -----
-def run_pipeline(
-    cfg: PipelineConfig,
-    inputs: List[InputSpec],
-    sheet_funcs: Mapping[str, Callable[[Mapping[str, pd.DataFrame]], pd.DataFrame]],
-    output_path: Union[str, Path],
-    password_provider: Optional[PasswordProvider] = None,
-    report: Optional[ProgressReporter] = None,
-) -> Path:
-    ctx = load_context(cfg, inputs, password_provider=password_provider, report=report)
-    sheets = build_output(sheet_funcs, ctx, report=report)
-    out = write_output_excel(sheets, output_path)
-    if report: report(f"Saved output: {out}")
-    return out
+    }])[["entity", "Total", "CC", "CIB", "IWPB"]]
