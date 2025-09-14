@@ -1,0 +1,227 @@
+
+# utility.py
+from __future__ import annotations
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Callable, Dict, Iterable, List, Mapping, Optional, Tuple, Union
+import pandas as pd
+import sys, os, tempfile
+from getpass import getpass
+
+# Types for UI integration
+PasswordProvider = Callable[[str], str]
+ProgressReporter = Callable[[str], None]
+
+# -------- File type support --------
+SUPPORTED_EXCEL_EXTS = {".xlsx", ".xlsm", ".xls", ".xlsb"}
+SUPPORTED_TEXT_EXTS  = {".csv", ".tsv"}
+
+def _pick_engine(ext: str) -> str:
+    ext = ext.lower()
+    if ext in (".xlsx", ".xlsm"): return "openpyxl"
+    if ext == ".xls": return "xlrd"
+    if ext == ".xlsb": return "pyxlsb"
+    raise ValueError(f"Unsupported Excel file type: {ext}")
+
+def _file_signature(path: Path) -> bytes:
+    with open(path, "rb") as f:
+        return f.read(8)
+
+def _ole_has_encryption_streams(path: Path) -> bool:
+    import olefile as _ole
+    if not _ole.isOleFile(str(path)): return False
+    ole = _ole.OleFileIO(str(path))
+    try:
+        names = {'%s' % '/'.join(parts) for parts in ole.listdir()}
+        return ("EncryptionInfo" in names) or ("EncryptedPackage" in names)
+    finally:
+        ole.close()
+
+def _is_probably_encrypted_excel(path: Path) -> Optional[bool]:
+    ext = path.suffix.lower()
+    sig = _file_signature(path)
+    is_zip = sig.startswith(b"PK")
+    if ext in (".xlsx",".xlsm"):
+        if is_zip: return False
+        return _ole_has_encryption_streams(path)
+    if ext == ".xlsb": return _ole_has_encryption_streams(path)
+    if ext == ".xls": return None
+    return None
+
+def _decrypt_to_temp(path: Path, password: str) -> str:
+    import msoffcrypto  # lazy import
+    ext = path.suffix.lower()
+    with open(path, "rb") as f:
+        of = msoffcrypto.OfficeFile(f)
+        of.load_key(password=password)
+        with tempfile.NamedTemporaryFile(delete=False, suffix=ext) as tmp:
+            of.decrypt(tmp)
+            return tmp.name
+
+def _read_csv_like(path: Path) -> pd.DataFrame:
+    ext = path.suffix.lower()
+    sep = "\t" if ext == ".tsv" else ","
+    for enc in ("utf-8","utf-8-sig","latin-1"):
+        try:
+            return pd.read_csv(path, sep=sep, encoding=enc)
+        except UnicodeDecodeError:
+            continue
+    return pd.read_csv(path, sep=sep, engine=None)
+
+class PasswordError(Exception):
+    """Raised when password attempts are exhausted or cancelled."""
+
+def read_tablelike_any(
+    path: Union[str, Path],
+    sheet_name: Optional[Union[str, int]] = None,
+    password: Optional[str] = None,
+    password_provider: Optional[PasswordProvider] = None,
+    max_tries: int = 3,
+    report: Optional[ProgressReporter] = None,
+) -> Dict[str, pd.DataFrame]:
+    """
+    Generalized reader:
+      - Excel (.xlsx/.xlsm/.xls/.xlsb): returns all sheets as {sheet_name: DataFrame}
+        (or single {name: df} if sheet_name is specified).
+      - CSV/TSV: returns {file_stem: DataFrame}.
+    If encrypted, uses `password` or calls `password_provider(filename)` up to max_tries.
+    Falls back to getpass() if none given (CLI usage).
+    """
+    path = Path(path)
+    ext = path.suffix.lower()
+
+    # text formats first
+    if ext in SUPPORTED_TEXT_EXTS:
+        df = _read_csv_like(path)
+        return {path.stem: df}
+
+    if ext not in SUPPORTED_EXCEL_EXTS:
+        raise ValueError(f"Unsupported file type: {ext}. Supported: {', '.join(sorted(SUPPORTED_TEXT_EXTS | SUPPORTED_EXCEL_EXTS))}")
+
+    engine = _pick_engine(ext)
+
+    # try normal read (not encrypted)
+    try:
+        dfs = pd.read_excel(path, sheet_name=None if sheet_name is None else sheet_name, engine=engine)
+        if isinstance(dfs, pd.DataFrame):
+            return {str(sheet_name): dfs}
+        return dfs
+    except Exception:
+        enc_guess = _is_probably_encrypted_excel(path)
+        if enc_guess is False:
+            raise  # not encryption; surface the original error
+
+        tries = 0
+        last_err: Optional[Exception] = None
+        while tries < max_tries:
+            pw = password
+            if pw is None and password_provider is not None:
+                pw = password_provider(path.name)
+            if pw is None:
+                pw = getpass(f"Enter OPEN password for '{path.name}': ")
+            try:
+                tmp_name = _decrypt_to_temp(path, pw)
+                try:
+                    dfs = pd.read_excel(tmp_name, sheet_name=None if sheet_name is None else sheet_name, engine=engine)
+                    if isinstance(dfs, pd.DataFrame):
+                        return {str(sheet_name): dfs}
+                    return dfs
+                finally:
+                    try: os.remove(tmp_name)
+                    except OSError: pass
+            except Exception as e:
+                last_err = e
+                tries += 1
+                password = None
+                if report:
+                    report(f"Password attempt {tries} failed for {path.name}.")
+        raise PasswordError(f"Failed to open '{path.name}' after {max_tries} attempts.") from last_err
+
+# -------- Discovery --------
+@dataclass
+class PipelineConfig:
+    master_folder: Union[str, Path]
+    excel_globs: Tuple[str, ...] = ("*.xlsx","*.xls","*.xlsm","*.xlsb","*.csv","*.tsv")
+    strict_inputs: bool = True
+    case_insensitive: bool = True
+    multi_match_policy: str = "latest"  # "latest" | "first" | "error"
+
+@dataclass
+class InputSpec:
+    logical_name: str             # key in context
+    keyword: str                  # substring in filename
+    subfolder: Optional[str] = None
+    sheet_name: Optional[str] = None
+    password: Optional[str] = None
+
+def discover_files(cfg: PipelineConfig, subfolder: Optional[str] = None) -> List[Path]:
+    root = Path(cfg.master_folder)
+    if not root.exists():
+        raise FileNotFoundError(f"Master folder not found: {root}")
+    if subfolder:
+        target = root / subfolder
+        if not target.exists():
+            if cfg.strict_inputs: raise FileNotFoundError(f"Subfolder not found: {target}")
+            return []
+        folders = [target]
+    else:
+        folders = [root] + [p for p in root.iterdir() if p.is_dir()]
+    files: List[Path] = []
+    for folder in folders:
+        for pat in cfg.excel_globs:
+            files.extend(folder.rglob(pat))
+    return files
+
+def pick_file_by_keyword(files: List[Path], keyword: str, case_insensitive: bool, policy: str) -> Optional[Path]:
+    kw = keyword.lower() if case_insensitive else keyword
+    matches: List[Path] = []
+    for f in files:
+        name = f.name.lower() if case_insensitive else f.name
+        parents = [p.name for p in f.parents if p != f.anchor]
+        parents = [p.lower() for p in parents] if case_insensitive else parents
+        if kw in name or any(kw in p for p in parents):
+            matches.append(f)
+    if not matches: return None
+    if len(matches) == 1: return matches[0]
+    if policy == "first": return sorted(matches)[0]
+    if policy == "latest": return max(matches, key=lambda p: p.stat().st_mtime)
+    raise FileExistsError(f"Multiple files match keyword '{keyword}': {[str(m) for m in matches]}")
+
+def pick_sheet(dfs: Dict[str, pd.DataFrame], desired: Optional[str]) -> pd.DataFrame:
+    if desired is None:
+        return dfs[next(iter(dfs.keys()))]
+    if desired in dfs: return dfs[desired]
+    low = {k.lower(): k for k in dfs.keys()}
+    if desired.lower() in low: return dfs[low[desired.lower()]]
+    raise KeyError(f"Sheet '{desired}' not found. Available: {list(dfs.keys())}")
+
+# -------- DataFrame utilities --------
+def ensure_columns(df: pd.DataFrame, cols: Iterable[str], context: str = "") -> None:
+    missing = [c for c in cols if c not in df.columns]
+    if missing: raise KeyError(f"Missing columns {missing} in {context or 'DataFrame'}; present={list(df.columns)}")
+
+def vlookup_merge(left: pd.DataFrame, right: pd.DataFrame, left_on: Union[str, List[str]], right_on: Union[str, List[str]], take_cols: Optional[List[str]] = None, how: str = "left", suffixes: Tuple[str, str] = ("", "_r")) -> pd.DataFrame:
+    if take_cols is not None:
+        right = right[list(dict.fromkeys((take_cols + (right_on if isinstance(right_on, list) else [right_on]))))]
+    return left.merge(right, left_on=left_on, right_on=right_on, how=how, suffixes=suffixes)
+
+def coalesce(series_list: List[pd.Series]) -> pd.Series:
+    out = series_list[0].copy()
+    for s in series_list[1:]: out = out.where(out.notna(), s)
+    return out
+
+def safe_cast(df: pd.DataFrame, cast_map: Mapping[str, str]) -> pd.DataFrame:
+    out = df.copy()
+    for col, dtype in cast_map.items():
+        if col in out.columns: out[col] = out[col].astype(dtype, errors="ignore")
+    return out
+
+def write_output_excel(sheets: Mapping[str, pd.DataFrame], output_path: Union[str, Path], engine: str = "xlsxwriter") -> Path:
+    output_path = Path(output_path)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    with pd.ExcelWriter(output_path, engine=engine) as writer:
+        for sheet, df in sheets.items():
+            safe = sheet[:31]
+            for ch in [":","/","\\","*","?","[","]"]: safe = safe.replace(ch, "_")
+            df.to_excel(writer, sheet_name=safe, index=False)
+    return output_path
