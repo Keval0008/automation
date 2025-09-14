@@ -1,164 +1,84 @@
-def sheet_Discount_rate(ctx: Mapping[str, pd.DataFrame]) -> pd.DataFrame:
+def sheet_Growth_rate_in_Percentage(ctx: Mapping[str, pd.DataFrame]) -> pd.DataFrame:
     """
-    Output sheet: "Discount_rate"
+    Build the "Growth_rate (in Percentage)" sheet.
 
-    Steps:
-      1) Find cell "Entity" => (RN1, CN1)
-      2) On row RN1-1, treat each CGU header (Group/IWPB/CIB/CC) as a span that
-         runs until the next header appears.
-      3) For each CGU span, on RN1 look for a cell containing "CoE LCY" (case-insensitive).
-         That column is the value column for that CGU.
-      4) In CN1, find the row for location/entity and read the values.
-      5) Return one-row DF: entity, Total, CC, CIB, IWPB (fill 0 when missing).
+    Inputs expected in ctx:
+      - "growth_rate": DataFrame loaded from folder 'growth_rate', filename keyword 'Growth', sheet_name 'CPI_A'.
+
+    Logic:
+      1) Find cell containing "Return To Index" (case-insensitive substring) -> (RN1, CN1).
+      2) On row RN1, find year columns from 1990 onward (cells that parse to 4-digit year >= 1990).
+      3) On column CN1, find the row that equals "United Arab Emirates" (case-insensitive). That's the value row.
+      4) For each year column, read value at (value_row, year_col). Parse to float; if it's "x%" keep x as number (not divided).
+      5) Output one-row DataFrame with columns: entity (renamed per helper), then years ascending.
     """
-    import re
     import numpy as np
     import pandas as pd
 
-    dr = ctx["discount_rate"]
-    ui = ctx["user_input"]
+    df = ctx["growth_rate"]
+    # prepare string view for matching
+    df_str = df.copy().applymap(lambda x: str(x).strip() if pd.notna(x) else "")
 
-    # ---- helpers / config ----
-    helper_config = {
-        "discount_rate": {
-            "HBME - United Arab Emirates": "5300_1GRT - HSBC Bank Middle East",
-            "Group": "Total",
-        }
-    }
-    # header normalization (case-insensitive)
-    cgu_header_map = {"group": "Total", "iwpb": "IWPB", "cib": "CIB", "cc": "CC"}
-    wanted_keys = ["Total", "CIB", "IWPB", "CC"]
+    # 1) locate "Return To Index"
+    matches = np.argwhere(np.vectorize(lambda x: "return to index" in x.lower())(df_str.values))
+    if matches.size == 0:
+        raise ValueError("Could not find 'Return To Index' in growth_rate sheet")
+    RN1, CN1 = matches[0].tolist()
 
-    # ---- user_input: entity + rollup ----
-    if not {"Field", "Value"}.issubset(ui.columns):
-        raise KeyError("user_input must have columns ['Field','Value']")
-    kv = {str(k).strip(): v for k, v in zip(ui["Field"], ui["Value"])}
-    entity_name = str(kv.get("entity", "")).strip()
-    rollup_expr = str(kv.get("cgu_rollup", "") or kv.get("cgu_rollups", "")).strip()
-
-    # include both LHS and RHS of '='; normalize via cgu_header_map and dedupe
-    def norm(label: str) -> str:
-        return cgu_header_map.get(label.strip().lower(), label.strip())
-
-    rollup_targets: list[str]
-    if "=" in rollup_expr:
-        left, right = rollup_expr.split("=", 1)
-        rhs = [x.strip() for x in re.split(r"[+]", right) if x.strip()]
-        rollup_targets = [norm(left)] + [norm(x) for x in rhs]
-    else:
-        rollup_targets = [norm(x) for x in re.split(r"[+]", rollup_expr) if x.strip()]
-    # default if parsing empty/failed
-    if not rollup_targets:
-        rollup_targets = wanted_keys.copy()
-
-    # de-duplicate preserving order, and keep only known keys
-    seen = set()
-    rollup_targets = [x for x in rollup_targets if not (x in seen or seen.add(x)) and x in wanted_keys]
-
-    # ---- cast to strings for scanning ----
-    dr_str = dr.copy().applymap(lambda x: str(x).strip() if pd.notna(x) else "")
-
-    # 1) locate "Entity" (case-insensitive, substring not required here)
-    pos = np.argwhere(dr_str.values == "Entity")
-    if pos.size == 0:
-        pos = np.argwhere(np.vectorize(lambda x: x.lower() == "entity")(dr_str.values))
-    if pos.size == 0:
-        raise ValueError("Could not find 'Entity' cell")
-    RN1, CN1 = pos[0].tolist()
-
-    # 2) build CGU spans from header row RN1-1
-    header_row_idx = RN1 - 1
-    if header_row_idx < 0:
-        raise ValueError("Invalid layout: header row is above the sheet start")
-
-    header_row = dr_str.iloc[header_row_idx, :].tolist()
-    starts: list[tuple[int, str]] = []  # (col_index, logical_cgu)
-    for j, raw in enumerate(header_row):
-        key = raw.strip().lower()
-        if key in cgu_header_map:
-            starts.append((j, cgu_header_map[key]))
-    if not starts:
-        raise ValueError("No CGU headers (Group/IWPB/CIB/CC) found on RN1-1")
-
-    # create spans: each header runs until the next header (exclusive)
-    max_col = dr_str.shape[1] - 1
-    spans: dict[str, range] = {}  # logical -> range(start, end_inclusive+1)
-    for idx, (start_col, logical) in enumerate(starts):
-        end_col = (starts[idx + 1][0] - 1) if idx + 1 < len(starts) else max_col
-        spans[logical] = range(start_col, end_col + 1)
-
-    # restrict to requested rollup targets (but ensure 'Total' is included if present)
-    spans = {k: v for k, v in spans.items() if k in set(rollup_targets + ["Total"])}
-
-    # 3) within each span, on RN1, find a column whose cell contains "CoE LCY"
-    rn1_row = dr_str.iloc[RN1, :]
-    value_cols: dict[str, int] = {}
-    for logical, rng in spans.items():
-        chosen = None
-        for c in rng:
-            cell_val = str(rn1_row.iat[c]).strip().lower()
-            if "coe lcy" in cell_val:
-                chosen = c
-                break  # first match in span
-        if chosen is not None:
-            value_cols[logical] = chosen
-        # if not found, we leave it absent for now (will default to 0 later)
-
-    if not value_cols:
-        raise ValueError("No 'CoE LCY' columns found (substring search within CGU spans)")
-
-    # 4) find entity row in the 'Entity' column (CN1)
-    loc_map = helper_config.get("discount_rate", {})
-    # prefer mapped location whose value==entity
-    location_label = next((loc for loc, ent in loc_map.items() if ent == entity_name), None)
-    # fallback to a known default location if provided
-    if location_label is None and "HBME - United Arab Emirates" in loc_map:
-        location_label = "HBME - United Arab Emirates"
-
-    entity_col = dr_str.iloc[:, CN1]
-    entity_row_idx = None
-    if location_label:
-        hits = entity_col[entity_col.str.lower() == location_label.lower()].index.tolist()
-        if hits:
-            entity_row_idx = hits[0]
-    if entity_row_idx is None and entity_name:
-        hits = entity_col[entity_col.str.lower() == entity_name.lower()].index.tolist()
-        if hits:
-            entity_row_idx = hits[0]
-    if entity_row_idx is None:
-        raise ValueError("Could not find the specified location/entity in the Entity column")
-
-    final_entity = loc_map.get(location_label, entity_name) or entity_col.iat[entity_row_idx]
-
-    # 5) fetch values per CGU (default 0 if no CoE LCY found in its span)
-    out_vals = {"Total": 0.0, "CC": 0.0, "CIB": 0.0, "IWPB": 0.0}
-    for logical in out_vals.keys():
-        col_idx = value_cols.get(logical)
-        if col_idx is None:
-            continue
-        raw = dr.iloc[entity_row_idx, col_idx]
-        val = 0.0
+    # 2) detect year columns on RN1
+    years_map: dict[int, int] = {}  # col_index -> year_int
+    row_vals = df_str.iloc[RN1, :].tolist()
+    for j, txt in enumerate(row_vals):
+        # allow forms like '1990', '1990 ', "1990.0"
         try:
-            val = float(raw)
+            year = int(float(txt))
         except Exception:
-            s = str(raw).strip()
-            if s.endswith("%"):
-                try:
-                    val = float(s[:-1]) / 100.0
-                except Exception:
-                    val = 0.0
-            else:
-                try:
-                    val = float(s)
-                except Exception:
-                    val = 0.0
-        out_vals[logical] = val
+            continue
+        if 1990 <= year <= 2100 and len(str(int(year))) == 4:
+            years_map[j] = int(year)
+    if not years_map:
+        raise ValueError("No year columns (>=1990) found on the RN1 row")
 
-    # assemble one-row output
-    return pd.DataFrame([{
-        "entity": final_entity,
-        "Total": out_vals.get("Total", 0.0),
-        "CC": out_vals.get("CC", 0.0),
-        "CIB": out_vals.get("CIB", 0.0),
-        "IWPB": out_vals.get("IWPB", 0.0),
-    }])[["entity", "Total", "CC", "CIB", "IWPB"]]
+    # 3) find value row for United Arab Emirates in CN1
+    col_series = df_str.iloc[:, CN1]
+    uae_matches = col_series[col_series.str.lower() == "united arab emirates"].index.tolist()
+    if not uae_matches:
+        # try substring containment as a fallback
+        uae_matches = col_series[col_series.str.lower().str.contains("united arab emirates")].index.tolist()
+    if not uae_matches:
+        raise ValueError("Could not locate 'United Arab Emirates' in the CN1 column")
+    value_row = uae_matches[0]
+
+    # 4) extract values for each year col
+    def parse_percentish(x) -> float:
+        if pd.isna(x):
+            return 0.0
+        s = str(x).strip()
+        if s == "":
+            return 0.0
+        # if looks like '3.2%' -> 3.2 (keep percentage, not decimal)
+        if s.endswith("%"):
+            try:
+                return float(s[:-1].strip())
+            except Exception:
+                return 0.0
+        # else attempt float directly
+        try:
+            return float(s)
+        except Exception:
+            return 0.0
+
+    # helper mapping for output entity name
+    helper_config = {'growth_rate': {'United Arab Emirates': '5300_1GRT - HSBC Bank Middle East'}}
+    entity_output = helper_config['growth_rate']['United Arab Emirates']
+
+    # gather results sorted by year
+    year_cols_sorted = sorted(years_map.items(), key=lambda kv: kv[1])  # (col, year)
+    data = {"entity": [entity_output]}
+    for col_idx, year in year_cols_sorted:
+        val = parse_percentish(df.iloc[value_row, col_idx])
+        data[year] = [val]
+
+    # produce DataFrame with 'entity' then ascending years
+    columns = ["entity"] + [y for _, y in year_cols_sorted]
+    return pd.DataFrame(data)[columns]
