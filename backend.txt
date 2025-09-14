@@ -89,7 +89,8 @@ def sheet_Discount_rate(ctx: Mapping[str, pd.DataFrame]) -> pd.DataFrame:
     rollup_targets = []
     if "=" in rollup_expr:
         left, right = rollup_expr.split("=", 1)
-        rollup_targets = [x.strip() for x in _re.split(r"[+]", right) if x.strip()]
+        rollup_targets = [left.strip()] + [x.strip() for x in _re.split(r"[+]", right) if x.strip()]
+
         # Map to logical names
         rollup_targets = list(dict.fromkeys([cgu_header_map.get(x, x) for x in rollup_targets]))
         # Include 'Total' explicitly if left corresponds to Group/Total
