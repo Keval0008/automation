@@ -1,76 +1,48 @@
-def sheet_look_ahead(ctx: Mapping[str, pd.DataFrame]) -> pd.DataFrame:
+def sheet_Manual_Adjustments_Mn_LCY(ctx: Mapping[str, pd.DataFrame]) -> pd.DataFrame:
     """
-    Build the 'look_ahead ' sheet (note the trailing space in the sheet name you use in sheet_funcs).
+    Build 'Manual_Adjustments(Mn LCY)' from user_input + derived rollup and years.
 
-    Input:
-      - ctx["user_input"]: DataFrame from user_input/user_input (sheet "user_input")
-        with at least columns: Field, Value (case-insensitive accepted).
-
-    Logic:
-      1) Find 'Field' and 'Value' columns.
-      2) Pull values for:
-         - entity
-         - testing_date
-         - TOR
-         - treat_current_year_as_historic
-         - cgu_rollup
-         - excluded_cgu_fcfe  (also supports older key 'exclude_cgu_fcfe')
-      3) Set constant Nones for 'remaining_year_fraction' and 'dta_excluded'.
-      4) Return one-row DataFrame with required columns.
+    Steps:
+      1) entity from user_input['entity']
+      2) cgu list from cgu_rollup (both LHS and RHS)
+      3) years list from current_year/testing_date + look_ahead
+      4) adj_list = ['RWA','PBT','Free_Cash_Flows','CET1']
+      5) Output rows = cartesian product of CGUs x adj_list, with zeros for Opening and each year.
     """
+    import itertools
     import pandas as pd
+    from utility import ui_to_kv, parse_cgu_rollup, derive_years_from_ui_kv
 
     ui = ctx["user_input"]
+    kv = ui_to_kv(ui)
 
-    # Find Field/Value columns (case-insensitive)
-    cols_lower = {str(c).strip().lower(): c for c in ui.columns}
-    field_col = cols_lower.get("field")
-    value_col = cols_lower.get("value")
-    if field_col is None or value_col is None:
-        raise KeyError("user_input must contain 'Field' and 'Value' columns (case-insensitive).")
+    # 1) entity
+    entity = str(kv.get("entity", "")).strip()
 
-    # To dict (preserve last non-empty value if duplicates)
-    kv = {}
-    for _, row in ui[[field_col, value_col]].iterrows():
-        k = str(row[field_col]).strip()
-        v = row[value_col]
-        if k and k.lower() != "nan":
-            kv[k] = v
+    # 2) cgu list from rollup
+    rollup_expr = kv.get("cgu_rollup") or kv.get("cgu_rollups") or ""
+    cgus = parse_cgu_rollup(rollup_expr)
 
-    # Helper to fetch with tolerant key names
-    def get_any(keys, default=None):
-        for k in keys:
-            if k in kv and str(kv[k]).strip() != "":
-                return kv[k]
-        return default
+    # 3) years
+    years = derive_years_from_ui_kv(kv)  # list[int]
 
-    entity = get_any(["entity"], "")
-    testing_date = get_any(["testing_date"], None)
-    TOR = get_any(["TOR"], None)
-    treat_hist = get_any(["treat_current_year_as_historic"], None)
-    cgu_rollup = get_any(["cgu_rollup", "cgu_rollups"], None)
-    excluded_cgu_fcfe = get_any(["excluded_cgu_fcfe", "exclude_cgu_fcfe"], None)
+    # 4) adjustment types
+    adj_list = ["RWA", "PBT", "Free_Cash_Flows", "CET1"]
 
-    data = {
-        "entity": [entity],
-        "testing_date": [testing_date],
-        "TOR": [TOR],
-        "treat_current_year_as_historic": [treat_hist],
-        "remaining_year_fraction": [None],
-        "cgu_rollup": [cgu_rollup],
-        "dta_excluded": [None],
-        "excluded_cgu_fcfe": [excluded_cgu_fcfe],
-    }
+    # 5) build cartesian product
+    rows = []
+    for cgu, adj in itertools.product(cgus, adj_list):
+        row = {
+            "entity": entity,
+            "business_line": cgu,
+            "adj_type": adj,
+            "Opening": 0.0,
+        }
+        for y in years:
+            row[y] = 0.0
+        rows.append(row)
 
-    # keep column order exactly as requested
-    cols = [
-        "entity",
-        "testing_date",
-        "TOR",
-        "treat_current_year_as_historic",
-        "remaining_year_fraction",
-        "cgu_rollup",
-        "dta_excluded",
-        "excluded_cgu_fcfe",
-    ]
-    return pd.DataFrame(data)[cols]
+    # consistent column order: entity, business_line, adj_type, Opening, years...
+    cols = ["entity", "business_line", "adj_type", "Opening"] + years
+    df_out = pd.DataFrame(rows, columns=cols)
+    return df_out
