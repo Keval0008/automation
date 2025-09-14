@@ -1,138 +1,151 @@
-
 # frontend.py
 import threading
+from datetime import datetime
 from pathlib import Path
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
 
 from utility import PipelineConfig, InputSpec
-from backend import run_pipeline, sheet_example
+from backend import run_pipeline, sheet_Discount_rate  # add more sheet functions later
+
 
 class App(tk.Tk):
     def __init__(self):
         super().__init__()
-        self.title("Excel Pipeline")
-        self.geometry("700x420")
+        self.title("Excel Pipeline Tool")
+        self.geometry("640x220")
         self._build_ui()
 
+    # ---------------- UI ----------------
     def _build_ui(self):
-        pad = 8
-
+        pad = 10
         frm = ttk.Frame(self)
         frm.pack(fill="both", expand=True, padx=pad, pady=pad)
 
         # Master folder
-        ttk.Label(frm, text="Master folder:").grid(row=0, column=0, sticky="w")
+        ttk.Label(frm, text="Master folder:").grid(row=0, column=0, sticky="e", padx=(0, 8))
         self.master_var = tk.StringVar()
-        e1 = ttk.Entry(frm, textvariable=self.master_var, width=70)
-        e1.grid(row=0, column=1, sticky="we", padx=(0, pad))
-        ttk.Button(frm, text="Browse", command=self._browse_master).grid(row=0, column=2)
+        ttk.Entry(frm, textvariable=self.master_var, width=54).grid(row=0, column=1, sticky="we")
+        ttk.Button(frm, text="Browse", command=self._browse_master).grid(row=0, column=2, padx=(8, 0))
 
-        # Output file
-        ttk.Label(frm, text="Output file:").grid(row=1, column=0, sticky="w")
+        # Output folder
+        ttk.Label(frm, text="Output folder:").grid(row=1, column=0, sticky="e", padx=(0, 8))
         self.output_var = tk.StringVar()
-        e2 = ttk.Entry(frm, textvariable=self.output_var, width=70)
-        e2.grid(row=1, column=1, sticky="we", padx=(0, pad))
-        ttk.Button(frm, text="Browse", command=self._browse_output).grid(row=1, column=2)
+        ttk.Entry(frm, textvariable=self.output_var, width=54).grid(row=1, column=1, sticky="we")
+        ttk.Button(frm, text="Browse", command=self._browse_output).grid(row=1, column=2, padx=(8, 0))
 
         # Run button
-        self.run_btn = ttk.Button(frm, text="Run", command=self._run_clicked)
-        self.run_btn.grid(row=2, column=0, pady=(pad, pad))
+        self.run_btn = ttk.Button(frm, text="Run", command=self._on_run_clicked)
+        self.run_btn.grid(row=2, column=1, pady=(pad, 0), sticky="w")
 
-        # Status
-        ttk.Label(frm, text="Status:").grid(row=3, column=0, sticky="nw")
-        self.status = tk.Text(frm, height=14, width=80, state="disabled")
-        self.status.grid(row=3, column=1, columnspan=2, sticky="nsew")
+        # One-line status
+        self.status_var = tk.StringVar(value="Ready.")
+        ttk.Label(frm, textvariable=self.status_var, foreground="#0A58CA").grid(
+            row=3, column=0, columnspan=3, sticky="w", pady=(pad, 0)
+        )
 
         frm.grid_columnconfigure(1, weight=1)
-        frm.grid_rowconfigure(3, weight=1)
 
-    # Browsers
+    # ---------------- Browsers ----------------
     def _browse_master(self):
         d = filedialog.askdirectory(title="Select master folder")
         if d:
             self.master_var.set(d)
 
     def _browse_output(self):
-        f = filedialog.asksaveasfilename(
-            title="Select output Excel file",
-            defaultextension=".xlsx",
-            filetypes=[("Excel files", "*.xlsx")]
-        )
-        if f:
-            self.output_var.set(f)
+        d = filedialog.askdirectory(title="Select output folder")
+        if d:
+            self.output_var.set(d)
 
-    # Logging
-    def log(self, msg: str):
-        self.status.configure(state="normal")
-        self.status.insert("end", msg + "\n")
-        self.status.see("end")
-        self.status.configure(state="disabled")
+    # ---------------- Status & Password ----------------
+    def report(self, msg: str):
+        # One-liner status
+        self.status_var.set(msg)
         self.update_idletasks()
 
-    # Password provider (modal)
     def password_provider(self, filename: str) -> str:
+        """Modal popup to get password for a protected workbook."""
         dlg = tk.Toplevel(self)
         dlg.title("Password required")
-        ttk.Label(dlg, text=f"Enter password for {filename}:").pack(padx=10, pady=10)
+        dlg.transient(self)
+        dlg.grab_set()
+
+        ttk.Label(dlg, text=f"Enter password for:\n{filename}").pack(padx=12, pady=(12, 6))
         var = tk.StringVar()
         entry = ttk.Entry(dlg, textvariable=var, show="*")
-        entry.pack(padx=10, pady=(0,10))
+        entry.pack(padx=12, pady=(0, 12))
         entry.focus_set()
 
         out = {"pw": None}
+
         def submit():
             out["pw"] = var.get()
             dlg.destroy()
 
-        ttk.Button(dlg, text="Submit", command=submit).pack(pady=(0,10))
-        dlg.transient(self)
-        dlg.grab_set()
+        ttk.Button(dlg, text="Submit", command=submit).pack(pady=(0, 12))
         self.wait_window(dlg)
-
-        if out["pw"] is None or out["pw"] == "":
-            messagebox.showerror("Password missing", "No password entered. You may be prompted again.")
         return out["pw"] or ""
 
-    # Run pipeline in a thread
-    def _run_clicked(self):
+    # ---------------- Run ----------------
+    def _on_run_clicked(self):
         master = self.master_var.get().strip()
-        output = self.output_var.get().strip()
-        if not master or not output:
-            messagebox.showwarning("Missing paths", "Please select master folder and output file.")
+        out_folder = self.output_var.get().strip()
+        if not master or not out_folder:
+            messagebox.showwarning("Missing paths", "Please select both Master folder and Output folder.")
             return
 
         self.run_btn.config(state="disabled")
-        self.status.configure(state="normal"); self.status.delete("1.0", "end"); self.status.configure(state="disabled")
+        self.status_var.set("Processing...")
 
         def worker():
             try:
+                # Config
                 cfg = PipelineConfig(master_folder=master)
-                # TODO: replace with the real input specs for your project
+
+                # Inputs (you can add more later)
                 inputs = [
-                    InputSpec(logical_name="discount_rate", subfolder="discount_rate", keyword="CoE rates"),
-                    InputSpec(logical_name="user_input", subfolder="user_input", keyword="user_input", sheet_name="user_input"),
+                    InputSpec(
+                        logical_name="discount_rate",
+                        subfolder="discount_rate",
+                        keyword="CoE rates",          # filename keyword
+                        sheet_name=None               # you can set a sheet if needed
+                    ),
+                    InputSpec(
+                        logical_name="user_input",
+                        subfolder="user_input",
+                        keyword="user_input",
+                        sheet_name="user_input"       # as per your spec
+                    ),
                 ]
+
+                # Sheet functions (extend as we implement more)
                 sheet_funcs = {
                     "Discount_rate": sheet_Discount_rate,
                 }
+
+                # Output file name inside the chosen folder
+                ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+                out_path = Path(out_folder) / f"input_template_{ts}.xlsx"
+
+                self.report("Running pipeline...")
                 run_pipeline(
                     cfg=cfg,
                     inputs=inputs,
                     sheet_funcs=sheet_funcs,
-                    output_path=output,
+                    output_path=out_path,
                     password_provider=self.password_provider,
-                    report=self.log,
+                    report=self.report,
                 )
-                self.log("Done.")
-                messagebox.showinfo("Success", f"Output saved to:\n{output}")
+                self.report(f"Saved: {out_path}")
+                messagebox.showinfo("Success", f"Output saved to:\n{out_path}")
             except Exception as e:
-                self.log(f"ERROR: {e}")
+                self.report(f"Error: {e}")
                 messagebox.showerror("Error", str(e))
             finally:
                 self.run_btn.config(state="normal")
 
         threading.Thread(target=worker, daemon=True).start()
+
 
 if __name__ == "__main__":
     App().mainloop()
