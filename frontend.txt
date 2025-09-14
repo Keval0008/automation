@@ -110,11 +110,11 @@ class App(tk.Tk):
                 cfg = PipelineConfig(master_folder=master)
                 # TODO: replace with the real input specs for your project
                 inputs = [
-                    InputSpec(logical_name="user_input",    subfolder="user_input",    keyword="user_input", sheet_name="Sheet1"),
-                    InputSpec(logical_name="discount_rate", subfolder="discount_rate", keyword="discount"),
+                    InputSpec(logical_name="discount_rate", subfolder="discount_rate", keyword="CoE rates"),
+                    InputSpec(logical_name="user_input", subfolder="user_input", keyword="user_input", sheet_name="user_input"),
                 ]
                 sheet_funcs = {
-                    "Example Output": sheet_example,  # replace with real sheet functions later
+                    "Discount_rate": sheet_Discount_rate,
                 }
                 run_pipeline(
                     cfg=cfg,
