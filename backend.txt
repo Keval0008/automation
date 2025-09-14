@@ -1,84 +1,95 @@
-def sheet_Growth_rate_in_Percentage(ctx: Mapping[str, pd.DataFrame]) -> pd.DataFrame:
+def sheet_CET1_required(ctx: Mapping[str, pd.DataFrame]) -> pd.DataFrame:
     """
-    Build the "Growth_rate (in Percentage)" sheet.
+    Output sheet: "CET1_required"
 
-    Inputs expected in ctx:
-      - "growth_rate": DataFrame loaded from folder 'growth_rate', filename keyword 'Growth', sheet_name 'CPI_A'.
+    Inputs:
+      - ctx["user_input"]: DataFrame from user_input/user_input (sheet "user_input")
+        expected to have columns like ["Field", "Value"] (case-insensitive OK).
 
     Logic:
-      1) Find cell containing "Return To Index" (case-insensitive substring) -> (RN1, CN1).
-      2) On row RN1, find year columns from 1990 onward (cells that parse to 4-digit year >= 1990).
-      3) On column CN1, find the row that equals "United Arab Emirates" (case-insensitive). That's the value row.
-      4) For each year column, read value at (value_row, year_col). Parse to float; if it's "x%" keep x as number (not divided).
-      5) Output one-row DataFrame with columns: entity (renamed per helper), then years ascending.
+      1) Identify the 'Field' and 'Value' columns.
+      2) start_year = 'current_year' if present; else parse year from 'testing_date' (MM/DD/YYYY).
+      3) look_ahead = int(value of 'look_ahead')
+      4) years = [start_year .. start_year + look_ahead - 1]
+      5) cet1 = float(value of 'CET1_required (in decimal)')
+      6) Output one row:
+         {"entity": "5300_1GRT - HSBC Bank Middle East",
+          "CET1 ratio": "Total",
+          "Opening": cet1,
+          2021: cet1, 2022: cet1, ...}
     """
-    import numpy as np
+    import re
     import pandas as pd
 
-    df = ctx["growth_rate"]
-    # prepare string view for matching
-    df_str = df.copy().applymap(lambda x: str(x).strip() if pd.notna(x) else "")
+    ui = ctx["user_input"]
 
-    # 1) locate "Return To Index"
-    matches = np.argwhere(np.vectorize(lambda x: "return to index" in x.lower())(df_str.values))
-    if matches.size == 0:
-        raise ValueError("Could not find 'Return To Index' in growth_rate sheet")
-    RN1, CN1 = matches[0].tolist()
+    # 1) Find columns (case-insensitive)
+    cols_lower = {str(c).strip().lower(): c for c in ui.columns}
+    field_col = cols_lower.get("field")
+    value_col = cols_lower.get("value")
+    if field_col is None or value_col is None:
+        raise KeyError("user_input must contain 'Field' and 'Value' columns (case-insensitive).")
 
-    # 2) detect year columns on RN1
-    years_map: dict[int, int] = {}  # col_index -> year_int
-    row_vals = df_str.iloc[RN1, :].tolist()
-    for j, txt in enumerate(row_vals):
-        # allow forms like '1990', '1990 ', "1990.0"
+    # Build a key/value dict from the rows (strip keys)
+    kv = {}
+    for _, row in ui[[field_col, value_col]].iterrows():
+        key = str(row[field_col]).strip()
+        if key != "" and key.lower() != "nan":
+            kv[key] = row[value_col]
+
+    # 2) Determine start_year
+    start_year = None
+    if "current_year" in kv and str(kv["current_year"]).strip() != "":
         try:
-            year = int(float(txt))
+            start_year = int(float(kv["current_year"]))
         except Exception:
-            continue
-        if 1990 <= year <= 2100 and len(str(int(year))) == 4:
-            years_map[j] = int(year)
-    if not years_map:
-        raise ValueError("No year columns (>=1990) found on the RN1 row")
+            start_year = None
+    if start_year is None:
+        # fallback to testing_date (MM/DD/YYYY)
+        td = str(kv.get("testing_date", "")).strip()
+        m = re.search(r"(\d{1,2})/(\d{1,2})/(\d{4})", td)
+        if not m:
+            raise ValueError("Could not determine start year: 'current_year' missing and 'testing_date' not in MM/DD/YYYY.")
+        start_year = int(m.group(3))
 
-    # 3) find value row for United Arab Emirates in CN1
-    col_series = df_str.iloc[:, CN1]
-    uae_matches = col_series[col_series.str.lower() == "united arab emirates"].index.tolist()
-    if not uae_matches:
-        # try substring containment as a fallback
-        uae_matches = col_series[col_series.str.lower().str.contains("united arab emirates")].index.tolist()
-    if not uae_matches:
-        raise ValueError("Could not locate 'United Arab Emirates' in the CN1 column")
-    value_row = uae_matches[0]
+    # 3) look_ahead
+    if "look_ahead" not in kv:
+        raise KeyError("Missing 'look_ahead' in user_input.")
+    try:
+        look_ahead = int(float(kv["look_ahead"]))
+    except Exception:
+        raise ValueError(f"Invalid look_ahead value: {kv['look_ahead']}")
 
-    # 4) extract values for each year col
-    def parse_percentish(x) -> float:
-        if pd.isna(x):
-            return 0.0
+    # 4) years list
+    years = list(range(start_year, start_year + look_ahead))
+
+    # 5) CET1 value
+    cet1_key = "CET1_required (in decimal)"
+    if cet1_key not in kv:
+        raise KeyError(f"Missing '{cet1_key}' in user_input.")
+    def to_float(x):
         s = str(x).strip()
-        if s == "":
-            return 0.0
-        # if looks like '3.2%' -> 3.2 (keep percentage, not decimal)
         if s.endswith("%"):
             try:
-                return float(s[:-1].strip())
+                return float(s[:-1]) / 100.0
             except Exception:
                 return 0.0
-        # else attempt float directly
         try:
             return float(s)
         except Exception:
             return 0.0
+    cet1 = to_float(kv[cet1_key])
 
-    # helper mapping for output entity name
-    helper_config = {'growth_rate': {'United Arab Emirates': '5300_1GRT - HSBC Bank Middle East'}}
-    entity_output = helper_config['growth_rate']['United Arab Emirates']
+    # 6) Assemble output (constant entity per spec)
+    entity_out = "5300_1GRT - HSBC Bank Middle East"
+    data = {
+        "entity": [entity_out],
+        "CET1 ratio": ["Total"],
+        "Opening": [cet1],
+    }
+    for y in years:
+        data[y] = [cet1]
 
-    # gather results sorted by year
-    year_cols_sorted = sorted(years_map.items(), key=lambda kv: kv[1])  # (col, year)
-    data = {"entity": [entity_output]}
-    for col_idx, year in year_cols_sorted:
-        val = parse_percentish(df.iloc[value_row, col_idx])
-        data[year] = [val]
-
-    # produce DataFrame with 'entity' then ascending years
-    columns = ["entity"] + [y for _, y in year_cols_sorted]
+    # Ensure column order: entity, CET1 ratio, Opening, years ascending
+    columns = ["entity", "CET1 ratio", "Opening"] + years
     return pd.DataFrame(data)[columns]
