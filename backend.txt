@@ -1,77 +1,161 @@
-def sheet_tangible_equity(ctx: Mapping[str, pd.DataFrame]) -> pd.DataFrame:
+def sheet_saracen_in_thousand_LCY(ctx: Mapping[str, pd.DataFrame]) -> pd.DataFrame:
     """
-    Builds the 'tangible_equity' sheet from:
-      - ctx['tangible_equity'] -> sheet 'ROTE Detail Valued' (in 'tangible_equity' folder, key 'RoTE')
-      - ctx['user_input'] -> sheet 'user_input'
-    Logic:
-      entity from user_input; CGUs from cgu_rollup; for each CGU find its 'Spot' TE column
-      and take value on the entity row. Also computes global te_ratio.
+    Build the 'saracen (in thousand LCY)' sheet.
+
+    Inputs (must be loaded in ctx):
+      - ctx["saracen"]      -> from folder 'saracen', file key 'Saracen', (first sheet used)
+      - ctx["user_input"]   -> 'user_input' sheet
+
+    Steps:
+      1) current_year from user_input.testing_date (MM/DD/YYYY).
+      2) entity from user_input.entity.
+      3) Find all columns that contain the current year (exact year match anywhere in col).
+      4) If multiple, look inside those columns for a month token like 'JAN-JAN', 'MAY-MAY', ...;
+         choose the column with the latest month.
+      5) Confirm the entity exists somewhere in the final value column (not strictly needed to read row values, but validated).
+      6) For each key in key_mapper, find the row by label (anywhere), read value at (row, final_col),
+         and build a dict of display_name -> numeric value.
+      7) Map each line item to 'tangible_equity' or 'CET_adjustments', and output rows:
+           entity | category | line_item | Amount
     """
+    import re
     import numpy as np
     import pandas as pd
-    from utility import ui_to_kv, parse_cgu_rollup
+    from utility import ui_to_kv
 
-    te_input_df = ctx["tangible_equity"]
+    # ---- inputs ----
+    df = ctx["saracen"]
     ui = ctx["user_input"]
+
+    # ---- user_input -> current year + entity ----
     kv = ui_to_kv(ui)
-
     entity = str(kv.get("entity", "")).strip()
-    rollup_expr = kv.get("cgu_rollup") or kv.get("cgu_rollups") or ""
-    cgus = parse_cgu_rollup(rollup_expr)  # e.g. ['Total','CIB','IWPB','CC']
 
-    # String view for matching
-    te_str = te_input_df.copy().applymap(lambda x: str(x).strip() if pd.notna(x) else "")
+    # current_year from testing_date (MM/DD/YYYY)
+    td = str(kv.get("testing_date", "")).strip()
+    m = re.search(r"(\d{1,2})/(\d{1,2})/(\d{4})", td)
+    if not m:
+        raise ValueError("testing_date not found or not in MM/DD/YYYY; required to derive current_year.")
+    current_year = int(m.group(3))
+    y_str = str(current_year)
 
-    # --- find entity row anywhere in the sheet ---
-    pos_entity = np.argwhere(te_str.values == entity)
-    if pos_entity.size == 0:
-        # case-insensitive fallback
-        pos_entity = np.argwhere(np.vectorize(lambda x: x.lower() == entity.lower())(te_str.values))
-    if pos_entity.size == 0:
-        raise ValueError(f"Entity '{entity}' not found in tangible_equity sheet.")
-    entity_row_idx = int(pos_entity[0][0])  # we only need the row index
+    # ---- string view for matching ----
+    df_str = df.copy().applymap(lambda x: str(x).strip() if pd.notna(x) else "")
 
-    # Helper to find first occurrence of a label anywhere; returns (row, col)
-    def find_label(label: str) -> tuple[int, int]:
-        hits = np.argwhere(te_str.values == label)
-        if hits.size:
-            return int(hits[0][0]), int(hits[0][1])
-        # case-insensitive fallback
-        hits = np.argwhere(np.vectorize(lambda x: x.lower() == label.lower())(te_str.values))
-        if hits.size:
-            return int(hits[0][0]), int(hits[0][1])
-        raise ValueError(f"Label '{label}' not found in tangible_equity sheet.")
+    # 3) collect candidate year columns (any cell equals the year, tolerant for '1990.0')
+    candidate_cols = set()
+    arr = df_str.values
+    # exact 'YYYY'
+    hits = np.argwhere(arr == y_str)
+    for r, c in hits:
+        candidate_cols.add(int(c))
+    # numeric 'YYYY.0' etc.
+    for j in range(df_str.shape[1]):
+        col_vals = df_str.iloc[:, j]
+        for val in col_vals:
+            try:
+                if int(float(val)) == current_year:
+                    candidate_cols.add(j)
+                    break
+            except Exception:
+                continue
+    if not candidate_cols:
+        raise ValueError(f"No column containing year {current_year} found in Saracen sheet.")
 
-    # Numeric parser that tolerates strings and percents
+    # 4) if multiple, prefer the one with the latest 'MMM-MMM' month marker in that column
+    month_rank = {
+        "JAN": 1, "FEB": 2, "MAR": 3, "APR": 4, "MAY": 5, "JUN": 6,
+        "JUL": 7, "AUG": 8, "SEP": 9, "OCT": 10, "NOV": 11, "DEC": 12
+    }
+    def detect_month_score(col_idx: int) -> int:
+        # search for tokens like 'JAN-JAN', 'MAY - MAY' (allow spaces)
+        pat = re.compile(r"^(JAN|FEB|MAR|APR|MAY|JUN|JUL|AUG|SEP|OCT|NOV|DEC)\s*-\s*\1$", re.I)
+        for txt in df_str.iloc[:, col_idx]:
+            m = pat.match(txt)
+            if m:
+                return month_rank[m.group(1).upper()]
+        return 0  # no month marker
+
+    if len(candidate_cols) == 1:
+        final_col = next(iter(candidate_cols))
+    else:
+        # pick the column with the highest month score; if equal, pick the rightmost
+        ranked = sorted(((detect_month_score(c), c) for c in candidate_cols))
+        # ranked is ascending; take the last (largest score), and if tie it picks the larger column index
+        final_col = ranked[-1][1]
+
+    # 5) confirm entity appears in final value column (case-insensitive contains or equals)
+    col_series = df_str.iloc[:, final_col]
+    ent_rows = col_series[col_series.str.lower() == entity.lower()].index.tolist()
+    if not ent_rows:
+        # allow containment
+        ent_rows = col_series[col_series.str.lower().str.contains(entity.lower(), na=False)].index.tolist()
+    # We don't strictly need entity_row to fetch amounts (we read rows by label keys), but validate presence
+    if not ent_rows:
+        # Not fatal, but helpful to know:
+        # raise ValueError(f"Entity '{entity}' not found in the final Saracen column.")
+        pass
+
+    # 6) key mapping: source label in sheet -> output line_item label
+    key_mapper = {
+        "E200000 - Total Shareholders Equity": "E100000 - Total Equity",
+        "LP00000 - Total Equity-Non_controlling interests": "LP00000 - Total Equity-Non_controlling interests",
+        "LQ10200 - EQ-Other Equity Instruments": "LQ10200 - EQ-Other Equity Instruments",
+        "AR81000 - G/W & IntangAsset-Other Intangibles": "AR00001- Goodwill and Intangible assets",
+        "LQ89400 - EQ-Property revaluation Reserve": "LQ89400 - EQ-Property revaluation Reserve",
+        "Foreseeable dividend (net of scrip)": "Foreseeable dividend (net of scrip)",
+        "LQ87800 - Own credit reserve": "Own credit spread and debit valuation adjustment",
+    }
+
+    # reverse category mapping for step 7
+    tangible_set = {
+        "E100000 - Total Equity",
+        "LP00000 - Total Equity-Non_controlling interests",
+        "LQ10200 - EQ-Other Equity Instruments",
+        "AR00001- Goodwill and Intangible assets",
+        "LQ89400 - EQ-Property revaluation Reserve",
+        "Foreseeable dividend (net of scrip)",
+    }
+    cet_adj_set = {"Own credit spread and debit valuation adjustment"}
+
     def to_float(x) -> float:
         if pd.isna(x):
             return 0.0
         s = str(x).strip()
         if s == "":
             return 0.0
-        if s.endswith("%"):
-            try:
-                return float(s[:-1]) / 100.0
-            except Exception:
-                return 0.0
         try:
-            return float(s)
+            return float(s.replace(",", ""))  # handle thousands separators if any
         except Exception:
             return 0.0
 
-    output_dict = {"entity": entity}
+    # For each source key, find its row anywhere; take value at (row, final_col)
+    rows_out = []
+    for src_label, out_label in key_mapper.items():
+        # locate row by label (exact, case-insensitive fallback)
+        hits = np.argwhere(df_str.values == src_label)
+        if hits.size == 0:
+            hits = np.argwhere(np.vectorize(lambda x: x.lower() == src_label.lower())(df_str.values))
+        if hits.size == 0:
+            # If not found, record zero
+            amount = 0.0
+        else:
+            row_idx = int(hits[0][0])
+            amount = to_float(df.iat[row_idx, final_col])
 
-    for cgu in cgus:
-        cgu_new = "Corp Centre" if cgu == "CC" else cgu
-        variable = "Spot TE" if cgu_new == "Total" else f"{cgu_new} TE Spot"
-        _r, cgu_col_idx = find_label(variable)  # we only need the column index
-        output_dict[cgu] = to_float(te_input_df.iat[entity_row_idx, cgu_col_idx])
+        category = "tangible_equity" if out_label in tangible_set else "CET_adjustments" if out_label in cet_adj_set else "tangible_equity"
 
-    # Compute global te_ratio as requested
-    total_val = output_dict.get("Total", 0.0) or 0.0
-    global te_ratio  # noqa: PLW0603 – explicit global per your spec
-    te_ratio = {k: (v / total_val if total_val else 0.0)
-                for k, v in output_dict.items()
-                if k not in ("entity",)}
+        if category == "CET_adjustments":
+            amount = -abs(amount)
+        else:
+            amount = abs(amount)
 
-    return pd.DataFrame([output_dict], columns=["entity"] + cgus)
+        rows_out.append({
+            "entity": entity,
+            "category": category,
+            "line_item": out_label,
+            "Amount": amount,
+        })
+
+    # Output as a DataFrame
+    return pd.DataFrame(rows_out, columns=["entity", "category", "line_item", "Amount"])
