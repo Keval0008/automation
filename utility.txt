@@ -225,3 +225,81 @@ def write_output_excel(sheets: Mapping[str, pd.DataFrame], output_path: Union[st
             for ch in [":","/","\\","*","?","[","]"]: safe = safe.replace(ch, "_")
             df.to_excel(writer, sheet_name=safe, index=False)
     return output_path
+
+def sheet_look_ahead(ctx: Mapping[str, pd.DataFrame]) -> pd.DataFrame:
+    """
+    Build the 'look_ahead ' sheet (note the trailing space in the sheet name you use in sheet_funcs).
+
+    Input:
+      - ctx["user_input"]: DataFrame from user_input/user_input (sheet "user_input")
+        with at least columns: Field, Value (case-insensitive accepted).
+
+    Logic:
+      1) Find 'Field' and 'Value' columns.
+      2) Pull values for:
+         - entity
+         - testing_date
+         - TOR
+         - treat_current_year_as_historic
+         - cgu_rollup
+         - excluded_cgu_fcfe  (also supports older key 'exclude_cgu_fcfe')
+      3) Set constant Nones for 'remaining_year_fraction' and 'dta_excluded'.
+      4) Return one-row DataFrame with required columns.
+    """
+    import pandas as pd
+
+    ui = ctx["user_input"]
+
+    # Find Field/Value columns (case-insensitive)
+    cols_lower = {str(c).strip().lower(): c for c in ui.columns}
+    field_col = cols_lower.get("field")
+    value_col = cols_lower.get("value")
+    if field_col is None or value_col is None:
+        raise KeyError("user_input must contain 'Field' and 'Value' columns (case-insensitive).")
+
+    # To dict (preserve last non-empty value if duplicates)
+    kv = {}
+    for _, row in ui[[field_col, value_col]].iterrows():
+        k = str(row[field_col]).strip()
+        v = row[value_col]
+        if k and k.lower() != "nan":
+            kv[k] = v
+
+    # Helper to fetch with tolerant key names
+    def get_any(keys, default=None):
+        for k in keys:
+            if k in kv and str(kv[k]).strip() != "":
+                return kv[k]
+        return default
+
+    entity = get_any(["entity"], "")
+    testing_date = get_any(["testing_date"], None)
+    TOR = get_any(["TOR"], None)
+    treat_hist = get_any(["treat_current_year_as_historic"], None)
+    cgu_rollup = get_any(["cgu_rollup", "cgu_rollups"], None)
+    excluded_cgu_fcfe = get_any(["excluded_cgu_fcfe", "exclude_cgu_fcfe"], None)
+
+    data = {
+        "entity": [entity],
+        "testing_date": [testing_date],
+        "TOR": [TOR],
+        "treat_current_year_as_historic": [treat_hist],
+        "remaining_year_fraction": [None],
+        "cgu_rollup": [cgu_rollup],
+        "dta_excluded": [None],
+        "excluded_cgu_fcfe": [excluded_cgu_fcfe],
+    }
+
+    # keep column order exactly as requested
+    cols = [
+        "entity",
+        "testing_date",
+        "TOR",
+        "treat_current_year_as_historic",
+        "remaining_year_fraction",
+        "cgu_rollup",
+        "dta_excluded",
+        "excluded_cgu_fcfe",
+    ]
+    return pd.DataFrame(data)[cols]
+
