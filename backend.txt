@@ -144,12 +144,6 @@ def sheet_saracen_in_thousand_LCY(ctx: Mapping[str, pd.DataFrame]) -> pd.DataFra
             amount = to_float(df.iat[row_idx, final_col])
 
         category = "tangible_equity" if out_label in tangible_set else "CET_adjustments" if out_label in cet_adj_set else "tangible_equity"
-
-        if category == "CET_adjustments":
-            amount = -abs(amount)
-        else:
-            amount = abs(amount)
-
         rows_out.append({
             "entity": entity,
             "category": category,
