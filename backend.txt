@@ -1,132 +1,560 @@
-def sheet_Tax_input(ctx: Mapping[str, pd.DataFrame]) -> pd.DataFrame:
+def sheet_Latest_FRP_RWA_in_billion_LCY(ctx: Mapping[str, pd.DataFrame]) -> pd.DataFrame:
     """
-    Build 'Tax_input':
-      - Read Effective tax rates from user_input/tax_input (sheet 'tax_input')
-      - Multiply the negative of the effective tax rates with PBT (Actual) numbers
-      - Output rows per CGU with: entity, business_line, tax_rate (NaN),
-        Opening, 2025..(dynamic years)
+    Build 'Latest_FRP_RWA (in billion LCY)'.
+
+    Inputs used via ctx + disk:
+      - ctx["user_input"] (we'll re-open 'rwa_pbt_mapper' sheet from user_input file on disk)
+      - Files in subfolder 'frp_rwa' discovered by mapper 'filename keyword':
+          * 'circulation'     -> sheets: 'Consolidation','CIB','IWB','OTH' (opening)
+          * 'dfsa'            -> sheet:  'Re-Segmentation' (BSM + Forecast/Base block)
+          * 'local rwa'       -> sheet:  'Submission (Cap Plan)' (Forecast/Base block)
+    Output:
+      rows per CGU (Total, CIB, IWPB, CC) with columns:
+        entity | business_line |
+        Actual|Opening | Actual|{years...} |
+        Overlays|Opening | Overlays|{years...}
     """
+    import os
     import re
-    import math
+    from pathlib import Path
     import numpy as np
     import pandas as pd
+    from utility import (
+        PipelineConfig, discover_files, pick_file_by_keyword, read_tablelike_any,
+        ui_to_kv, parse_cgu_rollup
+    )
 
-    # --- get PBT output from cache (must run after PBT sheet) ---
-    from backend import _PBT_CACHE  # same module
-    if _PBT_CACHE is None or _PBT_CACHE.empty:
-        raise RuntimeError("PBT cache is empty. Ensure 'Latest_FRP_PBT (in million LCY)' runs before 'Tax_input'.")
+    # -------------- helpers --------------
+    def to_float(x) -> float:
+        if pd.isna(x):
+            return 0.0
+        s = str(x).strip().replace(",", "")
+        if s == "":
+            return 0.0
+        try:
+            return float(s)
+        except Exception:
+            return 0.0
 
-    pbt_df = _PBT_CACHE
+    def df_str_view(df: pd.DataFrame) -> pd.DataFrame:
+        return df.copy().applymap(lambda x: str(x).strip() if pd.notna(x) else "")
 
-    # --- inputs: tax_input table ---
-    tax_df = ctx["tax_input"]  # this should be loaded from 'user input' / key 'user_input' / sheet 'tax_input'
+    def find_first(df_str: pd.DataFrame, target: str) -> tuple[int, int]:
+        """
+        First exact (case-insensitive) match; else first substring (case-insensitive).
+        Returns (row, col).
+        """
+        arr = df_str.values
+        t = target.strip().lower()
+        hits = np.argwhere(np.vectorize(lambda x: str(x).strip().lower() == t)(arr))
+        if hits.size:
+            r, c = hits[0]
+            return int(r), int(c)
+        hits = np.argwhere(np.vectorize(lambda x: t in str(x).strip().lower())(arr))
+        if hits.size:
+            r, c = hits[0]
+            return int(r), int(c)
+        raise ValueError(f"Label containing '{target}' not found.")
 
-    # ---- parse rates from the 'Effective tax rates' row ----
-    # Accept either a tidy table with columns (Opening, 2025, ...) or a single Value cell like '0.2203,2025:0.223,...'
-    # 1) find row by Field contains 'Effective tax rates'
-    def find_rates_row(df: pd.DataFrame) -> pd.Series:
-        cols_lower = {str(c).strip().lower(): c for c in df.columns}
-        # common patterns: Field/Value, or first col holds label
-        if "field" in cols_lower:
-            fld = cols_lower["field"]
-            mask = df[fld].astype(str).str.strip().str.lower().str.contains("effective tax rates")
-            if mask.any():
-                return df.loc[mask].iloc[0]
-        # fallback: scan first column
-        first_col = df.columns[0]
-        mask = df[first_col].astype(str).str.strip().str.lower().str.contains("effective tax rates")
-        if mask.any():
-            return df.loc[mask].iloc[0]
-        raise ValueError("Could not find 'Effective tax rates' row in tax_input.")
+    def find_row_contains(df_str: pd.DataFrame, target: str) -> int | None:
+        arr = df_str.values
+        t = target.strip().lower()
+        hits = np.argwhere(np.vectorize(lambda x: t in str(x).strip().lower())(arr))
+        return (int(hits[0][0]) if hits.size else None)
 
-    row = find_rates_row(tax_df)
+    def find_row_equals(df_str: pd.DataFrame, target: str) -> int | None:
+        arr = df_str.values
+        t = target.strip().lower()
+        hits = np.argwhere(np.vectorize(lambda x: str(x).strip().lower() == t)(arr))
+        return (int(hits[0][0]) if hits.size else None)
 
-    # Build a dict of rates: {'Opening': float, 2025: float, ...}
-    rates: dict[object, float] = {}
+    def col_has_token_in_row_range(df_str: pd.DataFrame, col: int, row: int, token: str) -> bool:
+        """Check if a specific row, col equals token (case-insensitive)."""
+        val = str(df_str.iat[row, col]).strip().lower()
+        return val == token.strip().lower()
 
-    # Case A: the row has separate columns named Opening / 4-digit years
-    for col in tax_df.columns:
-        name = str(col).strip()
-        low = name.lower()
-        if low == "field":
-            continue
-        if low == "opening":
-            try:
-                rates["Opening"] = float(str(row[col]).strip())
-            except Exception:
-                pass
-        else:
-            m = re.fullmatch(r"(19|20)\d{2}", name)
-            if m:
-                try:
-                    rates[int(name)] = float(str(row[col]).strip())
-                except Exception:
-                    pass
+    def year_token_variants(year: int) -> list[str]:
+        """Return tokens to search for a given year, preference: Dec-YY then YYYY."""
+        yy = year % 100
+        return [f"dec-{yy:02d}", str(year)]
 
-    # Case B: a single Value string like "0.2203,2025:0.223,2026:0.224"
-    if not rates:
-        # collect all non-field cells from the row into one string
-        vals = []
-        for col in tax_df.columns:
-            if str(col).strip().lower() == "field":
-                continue
-            cell = str(row[col]).strip()
-            if cell:
-                vals.append(cell)
-        blob = ",".join(vals)
+    def pick_year_col_in_range(df_str: pd.DataFrame, header_row: int, col_range: list[int], year: int) -> int | None:
+        """
+        In header_row (or header_row exact row as specified), search columns in col_range
+        for 'Dec-YY' first; if not found, 'YYYY'; else None.
+        """
+        tokens = year_token_variants(year)
+        # normalize values for that row
+        row_vals = [str(df_str.iat[header_row, c]).strip().lower() for c in col_range]
+        # try Dec-YY
+        if tokens[0] in row_vals:
+            idx = row_vals.index(tokens[0])
+            return col_range[idx]
+        # try YYYY
+        if tokens[1] in row_vals:
+            idx = row_vals.index(tokens[1])
+            return col_range[idx]
+        return None
 
-        # key:value pairs (Opening|YYYY):(number)
-        for m in re.finditer(r"\b(Opening|(?:19|20)\d{2})\s*[:=]\s*([0-9.]+)\b", blob, flags=re.I):
-            key = m.group(1)
-            val = float(m.group(2))
-            if key.lower() == "opening":
-                rates["Opening"] = val
+    def span_full_year_trend(df_str: pd.DataFrame, row_idx: int, start_col: int) -> list[int]:
+        """
+        Given the first 'Full Year Trend' cell at (row_idx, start_col),
+        extend right including blanks and repeated 'Full Year Trend' until a different non-blank cell appears.
+        """
+        def is_fyt_or_blank(s: str) -> bool:
+            t = s.strip().lower()
+            return (t == "") or (t == "full year trend")
+        end_col = start_col
+        while end_col + 1 < df_str.shape[1]:
+            nxt = str(df_str.iat[row_idx, end_col + 1])
+            if is_fyt_or_blank(nxt):
+                end_col += 1
             else:
-                rates[int(key)] = val
+                break
+        return list(range(start_col, end_col + 1))
 
-        # if still nothing, try to pick first bare number as Opening
-        if not rates:
-            m0 = re.search(r"\b([0-9]*\.?[0-9]+)\b", blob)
-            if m0:
-                rates["Opening"] = float(m0.group(1))
+    def open_mapper(cfg: PipelineConfig) -> pd.DataFrame:
+        files = discover_files(cfg, subfolder="user_input")
+        f = pick_file_by_keyword(files, "user_input", True, cfg.multi_match_policy)
+        if not f:
+            raise FileNotFoundError("user_input file not found for 'rwa_pbt_mapper'.")
+        dfs = read_tablelike_any(f, sheet_name="rwa_pbt_mapper")
+        return next(iter(dfs.values()))
 
-    # safety defaults
-    if "Opening" not in rates:
-        rates["Opening"] = 0.0
+    def open_frp_rwa_book(cfg: PipelineConfig, keyword: str) -> dict[str, pd.DataFrame]:
+        files = discover_files(cfg, subfolder="frp_rwa")
+        f = pick_file_by_keyword(files, keyword, True, cfg.multi_match_policy)
+        if not f:
+            raise FileNotFoundError(f"FRP RWA file not found for keyword '{keyword}'")
+        return read_tablelike_any(f)  # all sheets
 
-    # ---- figure out which year columns exist in PBT (Actual) ----
-    year_cols = []
-    for c in pbt_df.columns:
-        m = re.fullmatch(r"Actual\|(\d{4})", str(c))
-        if m:
-            year_cols.append(int(m.group(1)))
-    year_cols = sorted(year_cols)
+    # -------------- basics from user_input --------------
+    ui = ctx["user_input"]
+    kv = ui_to_kv(ui)
+    entity = str(kv.get("entity", "")).strip()
+    rollup_expr = kv.get("cgu_rollup") or kv.get("cgu_rollups") or ""
+    cgus = parse_cgu_rollup(rollup_expr)
+    # Ensure canonical (we will keep CC here)
+    cgus = [x for x in ["Total", "CIB", "IWPB", "CC"] if x in set(cgus)]
 
-    # ---- build Tax rows: − rate * PBT(Actual) ----
-    out_rows = []
-    for _, r in pbt_df.iterrows():
-        entity = r["entity"]
-        cgu = r["business_line"]
+    # Config for discovering books at runtime
+    cfg: PipelineConfig = ctx.get("_cfg")  # set earlier in load_context
+    if cfg is None:
+        raise RuntimeError("PipelineConfig missing in ctx['_cfg']; ensure load_context sets ctx['_cfg']=cfg")
 
-        row_out = {
+    # -------------- read mapper and filter for mapping='rwa' --------------
+    mapper = open_mapper(cfg)
+    cols = {c.strip().lower(): c for c in mapper.columns.map(str)}
+    need = ["mapping", "year", "filename keyword", "type"]
+    missing = [k for k in need if k not in cols]
+    if missing:
+        raise KeyError(f"Missing columns in rwa_pbt_mapper: {missing}")
+
+    df_map = mapper.rename(columns={
+        cols["mapping"]: "mapping",
+        cols["year"]: "year",
+        cols["filename keyword"]: "filename keyword",
+        cols["type"]: "type",
+    })
+    df_map = df_map[df_map["mapping"].astype(str).str.strip().str.lower() == "rwa"].copy()
+
+    # collect numeric years only (Opening handled separately via circulation)
+    def as_int_year(y):
+        try:
+            return int(float(y))
+        except Exception:
+            m = re.search(r"\b(19|20)\d{2}\b", str(y))
+            return int(m.group(0)) if m else None
+
+    entries = []
+    for _, r in df_map.iterrows():
+        y = as_int_year(r["year"])
+        if y is None:
+            continue
+        entries.append({
+            "year": y,
+            "keyword": str(r["filename keyword"]).strip(),
+            "type": str(r["type"]).strip().lower(),
+        })
+    if not entries:
+        # No years to output; build only Opening from circulation
+        entries = []
+
+    years_sorted = sorted({e["year"] for e in entries})
+
+    # -------------- parse OPENING values from circulation --------------
+    def parse_circulation_opening() -> dict[str, float]:
+        """
+        Steps 4A–4G across the 4 sheets:
+          sheets: 'Consolidation' -> 'Total', 'CIB' -> 'CIB', 'IWB' -> 'IWPB', 'OTH' -> 'CC'
+        """
+        book = open_frp_rwa_book(cfg, "circulation")
+        sheet_map = {"Consolidation": "Total", "CIB": "CIB", "IWB": "IWPB", "OTH": "CC"}
+        out = {"Total": 0.0, "CIB": 0.0, "IWPB": 0.0, "CC": 0.0}
+
+        for sname, logical in sheet_map.items():
+            if sname not in book:
+                continue
+            df = book[sname]
+            df_str = df_str_view(df)
+
+            # 4A: find DFSA (header anchor)
+            r_dfsa, c_dfsa = find_first(df_str, "DFSA")
+            # 4B: lookup value = the cell one row below in same column (e.g., "Apr'25")
+            lookup_token = str(df_str.iat[r_dfsa + 1, c_dfsa]).strip()
+            # 4C: in header column (c_dfsa), find "USD" row
+            row_usd = find_first(df_str, "USD")[0]  # row number
+
+            # 4D: in the USD row, find the first col where cell equals lookup_token;
+            #     take contiguous range to the right while cells are blank or still equal lookup_token
+            #     (blank considered "within range" until a new different token appears)
+            # find first column in that row that matches the token
+            start_col = None
+            for j in range(df_str.shape[1]):
+                if str(df_str.iat[row_usd, j]).strip() == lookup_token:
+                    start_col = j
+                    break
+            if start_col is None:
+                # if not exact, try case-insensitive
+                for j in range(df_str.shape[1]):
+                    if str(df_str.iat[row_usd, j]).strip().lower() == lookup_token.lower():
+                        start_col = j
+                        break
+            if start_col is None:
+                # couldn't find token -> opening 0 for this sheet
+                continue
+
+            # extend range including blanks and repeated token
+            end_col = start_col
+            while end_col + 1 < df_str.shape[1]:
+                nxt = str(df_str.iat[row_usd, end_col + 1]).strip()
+                if nxt == "" or nxt.lower() == lookup_token.lower():
+                    end_col += 1
+                else:
+                    break
+            year_cols = list(range(start_col, end_col + 1))
+
+            # 4E: in header column, find rows "Standardised" and "Classification"
+            row_std = find_first(df_str, "Standardised")[0]
+            row_cls = find_first(df_str, "Classification")[0]
+
+            # among year_cols, pick the first column where row_std == 'HBME' AND row_cls == 'RWA'
+            val_col = None
+            for c in year_cols:
+                if str(df_str.iat[row_std, c]).strip().upper() == "HBME" and \
+                   str(df_str.iat[row_cls, c]).strip().upper() == "RWA":
+                    val_col = c
+                    break
+            if val_col is None:
+                # nothing matched -> opening 0 for this sheet
+                continue
+
+            # 4F: in header column, find "Grand Total" row
+            row_gt = find_first(df_str, "Grand Total")[0]
+
+            # 4G: take value at (row_gt, val_col)
+            out[logical] = to_float(df.iat[row_gt, val_col])
+
+        # ensure Total at least sum of CIB+IWPB+CC if missing
+        if out.get("Total", 0.0) == 0.0:
+            out["Total"] = out.get("CIB", 0.0) + out.get("IWPB", 0.0) + out.get("CC", 0.0)
+        return out
+
+    opening_dict = parse_circulation_opening()  # always opening source
+
+    # -------------- DFSA parser & BSM cache --------------
+    def parse_bsm_dfsa() -> dict[str, float]:
+        """
+        5A–5D: 'Re-Segmentation' sheet → 'Non-Counterparty Credit Risk' column,
+        then rows for IWPB/CIB/Corporate Centre; take value at (row, col+1).
+        """
+        book = open_frp_rwa_book(cfg, "dfsa")
+        if "Re-Segmentation" not in book:
+            # try to find case-insensitive
+            target = next((k for k in book if k.strip().lower() == "re-segmentation".lower()), None)
+            if target is None:
+                return {"IWPB": 0.0, "CIB": 0.0, "CC": 0.0}
+            sheet = target
+        else:
+            sheet = "Re-Segmentation"
+
+        df = book[sheet]
+        df_str = df_str_view(df)
+
+        # 5B: locate 'Non-Counterparty Credit Risk'
+        r_bsm, c_bsm = find_first(df_str, "Non-Counterparty Credit Risk")
+
+        def row_for(label: str) -> int | None:
+            # find in the same column (c_bsm), below r_bsm
+            for i in range(r_bsm + 1, df_str.shape[0]):
+                if str(df_str.iat[i, c_bsm]).strip().lower() == label.lower():
+                    return i
+            # also allow substring match below
+            for i in range(r_bsm + 1, df_str.shape[0]):
+                if label.lower() in str(df_str.iat[i, c_bsm]).strip().lower():
+                    return i
+            return None
+
+        r_iwpb = row_for("IWPB")
+        r_cib  = row_for("CIB")
+        r_cc   = row_for("Corporate Centre")
+
+        out = {"IWPB": 0.0, "CIB": 0.0, "CC": 0.0}
+        if r_iwpb is not None:
+            out["IWPB"] = to_float(df.iat[r_iwpb, c_bsm + 1])
+        if r_cib is not None:
+            out["CIB"]  = to_float(df.iat[r_cib,  c_bsm + 1])
+        if r_cc is not None:
+            out["CC"]   = to_float(df.iat[r_cc,   c_bsm + 1])
+        return out
+
+    def parse_dfsa_years(years: list[int], bsm_dict: dict[str, float]) -> dict[int, dict[str, float]]:
+        """
+        5E–5L: From 'Re-Segmentation' sheet:
+          - anchor: 'Forecast/ Base (USD millions)' -> (lookup_row, lookup_col)
+          - find 'Total' row in that column
+          - find header row containing 'Total','iWPB','CIB','TOTAL CC','BSM'
+          - build contiguous ranges for each header
+          - in (header_row+2), for each range pick Dec-YY else YYYY
+          - read values at (value_row, value_col) for each header
+          - final: Total=value['Total']; IWPB=IWPB + bsm*BSM; CIB=...; CC=(TOTAL CC)+bsm*BSM
+        """
+        book = open_frp_rwa_book(cfg, "dfsa")
+        # target sheet
+        if "Re-Segmentation" not in book:
+            sheet = next((k for k in book if k.strip().lower() == "re-segmentation".lower()), None)
+            if sheet is None:
+                return {y: {"Total": 0, "IWPB": 0, "CIB": 0, "CC": 0} for y in years}
+        else:
+            sheet = "Re-Segmentation"
+
+        df = book[sheet]
+        df_str = df_str_view(df)
+
+        # 5E: forecast/base anchor (row, col)
+        r_fb, c_fb = find_first(df_str, "Forecast/ Base (USD millions)")
+
+        # 5F: in lookup column (c_fb) find 'Total' exact row
+        r_total = None
+        for i in range(df_str.shape[0]):
+            if str(df_str.iat[i, c_fb]).strip().lower() == "total":
+                r_total = i; break
+        if r_total is None:
+            return {y: {"Total": 0, "IWPB": 0, "CIB": 0, "CC": 0} for y in years}
+
+        # 5G: header row containing all of the keys
+        header_keys = ["Total", "iWPB", "CIB", "TOTAL CC", "BSM"]
+        header_row = None
+        for i in range(df_str.shape[0]):
+            row_vals = " ".join(df_str.iloc[i, :].tolist()).lower()
+            if all(k.lower() in row_vals for k in header_keys):
+                header_row = i
+                break
+        if header_row is None:
+            return {y: {"Total": 0, "IWPB": 0, "CIB": 0, "CC": 0} for y in years}
+
+        # 5H: contiguous ranges for each key (start at each first appearance, extend through blanks/repeats)
+        def range_for_key(k: str) -> list[int]:
+            # find first column where header_row cell equals k (case-insensitive exact)
+            start = None
+            for j in range(df_str.shape[1]):
+                if str(df_str.iat[header_row, j]).strip().lower() == k.lower():
+                    start = j; break
+            if start is None:
+                # allow substring
+                for j in range(df_str.shape[1]):
+                    if k.lower() in str(df_str.iat[header_row, j]).strip().lower():
+                        start = j; break
+            if start is None:
+                return []
+            # extend right while blanks or repeated key
+            end = start
+            while end + 1 < df_str.shape[1]:
+                nxt = str(df_str.iat[header_row, end + 1]).strip()
+                if nxt == "" or nxt.lower() == k.lower():
+                    end += 1
+                else:
+                    break
+            return list(range(start, end + 1))
+
+        ranges = {k: range_for_key(k) for k in header_keys}
+
+        # 5I: the "year row" is header_row + 2
+        year_row = header_row + 2
+
+        # 5J/K: per year, pick column by Dec-YY else YYYY inside each range; fetch values at (r_total, col)
+        raw_vals_by_year = {}
+        for y in years:
+            cols_total = ranges.get("Total", [])
+            cols_iwpb  = ranges.get("iWPB", [])
+            cols_cib   = ranges.get("CIB", [])
+            cols_cc    = ranges.get("TOTAL CC", [])
+            cols_bsm   = ranges.get("BSM", [])
+
+            c_total = pick_year_col_in_range(df_str, year_row, cols_total, y) if cols_total else None
+            c_iwpb  = pick_year_col_in_range(df_str, year_row, cols_iwpb,  y) if cols_iwpb  else None
+            c_cib   = pick_year_col_in_range(df_str, year_row, cols_cib,   y) if cols_cib   else None
+            c_cc    = pick_year_col_in_range(df_str, year_row, cols_cc,    y) if cols_cc    else None
+            c_bsm   = pick_year_col_in_range(df_str, year_row, cols_bsm,   y) if cols_bsm   else None
+
+            v_total = to_float(df.iat[r_total, c_total]) if c_total is not None else 0.0
+            v_iwpb  = to_float(df.iat[r_total, c_iwpb])  if c_iwpb  is not None else 0.0
+            v_cib   = to_float(df.iat[r_total, c_cib])   if c_cib   is not None else 0.0
+            v_cc    = to_float(df.iat[r_total, c_cc])    if c_cc    is not None else 0.0
+            v_bsm   = to_float(df.iat[r_total, c_bsm])   if c_bsm   is not None else 0.0
+
+            raw_vals_by_year[y] = {"Total": v_total, "IWPB": v_iwpb, "CIB": v_cib, "CC": v_cc, "BSM": v_bsm}
+
+        # 5L: apply BSM ratios
+        final_by_year = {}
+        for y, d in raw_vals_by_year.items():
+            bsm_val = d.get("BSM", 0.0)
+            final_by_year[y] = {
+                "Total": d.get("Total", 0.0),
+                "IWPB": d.get("IWPB", 0.0) + bsm_dict.get("IWPB", 0.0) * bsm_val,
+                "CIB":  d.get("CIB",  0.0) + bsm_dict.get("CIB",  0.0) * bsm_val,
+                "CC":   d.get("CC",   0.0) + bsm_dict.get("CC",   0.0) * bsm_val,
+            }
+        return final_by_year
+
+    # -------------- local RWA parser --------------
+    def parse_local_rwa_years(years: list[int], bsm_dict: dict[str, float]) -> dict[int, dict[str, float]]:
+        """
+        6A–6G: 'Submission (Cap Plan)'
+          - anchor 'Forecast/ Base (USD millions)' -> (lookup_row, lookup_col)
+          - find exact keys 'Total','IWPB','CIB','CC','CC (BSM)' rows/cols
+          - for 'Total', in (Total_row+2) pick 'Dec-YY' else 'YYYY' column
+          - in (Total_row+1), find substring 'Forecast' and capture whole string as lookup key
+          - in lookup column (lookup_col), find 'Total {lookup_key}' first row after Total row for that year
+          - values by cgu: use corresponding rows & chosen columns; include BSM value from 'CC (BSM)'
+          - final per year: Total; IWPB = IWPB + bsm*BSM; CIB = CIB + bsm*BSM; CC = CC + bsm*BSM
+        """
+        book = open_frp_rwa_book(cfg, "local rwa")
+        # target sheet
+        target_sheet = "Submission (Cap Plan)"
+        if target_sheet not in book:
+            target_sheet = next((k for k in book if k.strip().lower() == "submission (cap plan)"), None)
+            if target_sheet is None:
+                return {y: {"Total": 0, "IWPB": 0, "CIB": 0, "CC": 0} for y in years}
+
+        df = book[target_sheet]
+        df_str = df_str_view(df)
+
+        # 6B: anchor
+        r_fb, c_fb = find_first(df_str, "Forecast/ Base (USD millions)")
+
+        # 6C: rows for exact keys
+        def pos_for_exact(label: str) -> tuple[int, int] | None:
+            hits = np.argwhere(np.vectorize(lambda x: str(x).strip().lower() == label.lower())(df_str.values))
+            if hits.size:
+                r, c = hits[0]
+                return int(r), int(c)
+            return None
+
+        pos_total = pos_for_exact("Total")
+        pos_iwpb  = pos_for_exact("IWPB")
+        pos_cib   = pos_for_exact("CIB")
+        pos_cc    = pos_for_exact("CC")
+        pos_ccbsm = pos_for_exact("CC (BSM)")
+
+        if pos_total is None:
+            # if even Total is missing, return zeros
+            return {y: {"Total": 0, "IWPB": 0, "CIB": 0, "CC": 0} for y in years}
+
+        r_total, c_total = pos_total
+        # 6E: at (Total_row+1), find substring 'Forecast' and capture the entire string
+        forecast_key = ""
+        row_vals = df_str.iloc[r_total + 1, :].tolist()
+        for txt in row_vals:
+            t = str(txt).strip()
+            if "forecast" in t.lower():
+                forecast_key = t
+                break
+
+        # 6D/6F/6G: per-year values
+        out_by_year = {}
+        for y in years:
+            # 6D: choose year column using Total_row+2
+            year_row = r_total + 2
+            all_cols = list(range(df_str.shape[1]))
+            c_year = pick_year_col_in_range(df_str, year_row, all_cols, y)
+
+            # 6F: in lookup column (c_fb), find 'Total {forecast_key}' that appears after r_total
+            row_total_forecast = None
+            search_token = f"Total {forecast_key}".strip()
+            for i in range(r_total + 1, df_str.shape[0]):
+                if str(df_str.iat[i, c_fb]).strip().lower() == search_token.lower():
+                    row_total_forecast = i
+                    break
+                # allow substring
+                if search_token.lower() in str(df_str.iat[i, c_fb]).strip().lower():
+                    row_total_forecast = i
+                    break
+
+            # fetch raw values
+            def safe_at(r: int | None, c: int | None) -> float:
+                if r is None or c is None:
+                    return 0.0
+                return to_float(df.iat[r, c])
+
+            total_v = safe_at(row_total_forecast, c_year)
+
+            iwpb_v = safe_at(pos_iwpb[0], c_year) if pos_iwpb else 0.0
+            cib_v  = safe_at(pos_cib[0],  c_year) if pos_cib  else 0.0
+            cc_v   = safe_at(pos_cc[0],   c_year) if pos_cc   else 0.0
+            bsm_v  = safe_at(pos_ccbsm[0], c_year) if pos_ccbsm else 0.0
+
+            out_by_year[y] = {
+                "Total": total_v,
+                "IWPB": iwpb_v + bsm_dict.get("IWPB", 0.0) * bsm_v,
+                "CIB":  cib_v  + bsm_dict.get("CIB",  0.0) * bsm_v,
+                "CC":   cc_v   + bsm_dict.get("CC",   0.0) * bsm_v,
+            }
+
+        return out_by_year
+
+    # -------------- build values for each year by mapping --------------
+    # cache BSM only once when needed
+    global _RWA_BSM_CACHE
+    year_values: dict[int, dict[str, float]] = {}  # {year: {cgu:value}}
+    for e in entries:
+        year = e["year"]
+        fkey = (e["keyword"] or "").lower()
+        typ  = (e["type"] or "").lower()
+
+        if "dfsa" in fkey:
+            if _RWA_BSM_CACHE is None:
+                _RWA_BSM_CACHE = parse_bsm_dfsa()
+            dfsa_vals = parse_dfsa_years([year], _RWA_BSM_CACHE)
+            year_values[year] = dfsa_vals.get(year, {"Total": 0, "IWPB": 0, "CIB": 0, "CC": 0})
+        elif "local rwa" in fkey:
+            if _RWA_BSM_CACHE is None:
+                _RWA_BSM_CACHE = parse_bsm_dfsa()
+            lr_vals = parse_local_rwa_years([year], _RWA_BSM_CACHE)
+            year_values[year] = lr_vals.get(year, {"Total": 0, "IWPB": 0, "CIB": 0, "CC": 0})
+        elif "circulation" in fkey:
+            # opening handled by circulation; ignore as a year entry
+            continue
+        else:
+            # unknown keyword → zeroes
+            year_values[year] = {"Total": 0, "IWPB": 0, "CIB": 0, "CC": 0}
+
+    # -------------- build output rows --------------
+    actual_cols  = ["Actual|Opening"] + [f"Actual|{y}" for y in years_sorted]
+    overlay_cols = ["Overlays|Opening"] + [f"Overlays|{y}" for y in years_sorted]
+
+    rows = []
+    for cgu in cgus:
+        row = {
             "entity": entity,
             "business_line": cgu,
-            "tax_rate": np.nan,  # per spec
+            "Actual|Opening": opening_dict.get(cgu, 0.0),
+            "Overlays|Opening": 0.0,
         }
+        for y in years_sorted:
+            row[f"Actual|{y}"]   = year_values.get(y, {}).get(cgu, 0.0)
+            row[f"Overlays|{y}"] = 0.0
+        rows.append(row)
 
-        # Opening
-        pbt_open = float(r.get("Actual|Opening", 0.0) or 0.0)
-        rate_open = float(rates.get("Opening", 0.0) or 0.0)
-        row_out["Opening"] = - rate_open * pbt_open
-
-        # Years
-        for y in year_cols:
-            pbt_val = float(r.get(f"Actual|{y}", 0.0) or 0.0)
-            rate_y = float(rates.get(y, 0.0) or 0.0)
-            row_out[y] = - rate_y * pbt_val
-
-        out_rows.append(row_out)
-
-    # Column order: entity, business_line, tax_rate, Opening, then dynamic years (ascending)
-    cols = ["entity", "business_line", "tax_rate", "Opening"] + year_cols
-    return pd.DataFrame(out_rows, columns=cols)
+    cols_out = ["entity", "business_line"] + actual_cols + overlay_cols
+    return pd.DataFrame(rows, columns=cols_out)
