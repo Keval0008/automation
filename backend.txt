@@ -1,34 +1,132 @@
-# Find all candidate columns for this target year
-def has_year(col: int, y: int) -> bool:
-    col_vals = df_str.iloc[:, col].tolist()
-    for txt in col_vals:
-        yy = year_from_any(txt)
-        if yy == y:
-            return True
-    return False
+def sheet_Tax_input(ctx: Mapping[str, pd.DataFrame]) -> pd.DataFrame:
+    """
+    Build 'Tax_input':
+      - Read Effective tax rates from user_input/tax_input (sheet 'tax_input')
+      - Multiply the negative of the effective tax rates with PBT (Actual) numbers
+      - Output rows per CGU with: entity, business_line, tax_rate (NaN),
+        Opening, 2025..(dynamic years)
+    """
+    import re
+    import math
+    import numpy as np
+    import pandas as pd
 
-def matches_type_selector(col: int, typ: str) -> bool:
-    col_vals = [str(v).strip() for v in df_str.iloc[:, col].tolist()]
-    t = (typ or "").strip().lower()
-    if t in ("forcasted", "actual"):  # mapper uses 'forcasted' spelling
-        # exact 'Fcst'
-        return any(v == "Fcst" for v in col_vals)
-    elif t == "budgeted":
-        # substring 'Budget' (case-insensitive)
-        return any("budget" in v.lower() for v in col_vals)
-    else:
-        # default fallback: accept anything (we'll still filter by year)
-        return True
+    # --- get PBT output from cache (must run after PBT sheet) ---
+    from backend import _PBT_CACHE  # same module
+    if _PBT_CACHE is None or _PBT_CACHE.empty:
+        raise RuntimeError("PBT cache is empty. Ensure 'Latest_FRP_PBT (in million LCY)' runs before 'Tax_input'.")
 
-# Choose column for this (cgu, year, typ)
-candidates = [c for c in yr_cols if has_year(c, y)]
-col_choice = None
-# Prefer candidates that satisfy the type selector
-prio = [c for c in candidates if matches_type_selector(c, typ)]
-if prio:
-    col_choice = prio[0]
-elif candidates:
-    col_choice = candidates[0]
+    pbt_df = _PBT_CACHE
 
-if col_choice is not None:
-    values[y][cgu] = to_float(df.iat[row_pbt, col_choice])
+    # --- inputs: tax_input table ---
+    tax_df = ctx["tax_input"]  # this should be loaded from 'user input' / key 'user_input' / sheet 'tax_input'
+
+    # ---- parse rates from the 'Effective tax rates' row ----
+    # Accept either a tidy table with columns (Opening, 2025, ...) or a single Value cell like '0.2203,2025:0.223,...'
+    # 1) find row by Field contains 'Effective tax rates'
+    def find_rates_row(df: pd.DataFrame) -> pd.Series:
+        cols_lower = {str(c).strip().lower(): c for c in df.columns}
+        # common patterns: Field/Value, or first col holds label
+        if "field" in cols_lower:
+            fld = cols_lower["field"]
+            mask = df[fld].astype(str).str.strip().str.lower().str.contains("effective tax rates")
+            if mask.any():
+                return df.loc[mask].iloc[0]
+        # fallback: scan first column
+        first_col = df.columns[0]
+        mask = df[first_col].astype(str).str.strip().str.lower().str.contains("effective tax rates")
+        if mask.any():
+            return df.loc[mask].iloc[0]
+        raise ValueError("Could not find 'Effective tax rates' row in tax_input.")
+
+    row = find_rates_row(tax_df)
+
+    # Build a dict of rates: {'Opening': float, 2025: float, ...}
+    rates: dict[object, float] = {}
+
+    # Case A: the row has separate columns named Opening / 4-digit years
+    for col in tax_df.columns:
+        name = str(col).strip()
+        low = name.lower()
+        if low == "field":
+            continue
+        if low == "opening":
+            try:
+                rates["Opening"] = float(str(row[col]).strip())
+            except Exception:
+                pass
+        else:
+            m = re.fullmatch(r"(19|20)\d{2}", name)
+            if m:
+                try:
+                    rates[int(name)] = float(str(row[col]).strip())
+                except Exception:
+                    pass
+
+    # Case B: a single Value string like "0.2203,2025:0.223,2026:0.224"
+    if not rates:
+        # collect all non-field cells from the row into one string
+        vals = []
+        for col in tax_df.columns:
+            if str(col).strip().lower() == "field":
+                continue
+            cell = str(row[col]).strip()
+            if cell:
+                vals.append(cell)
+        blob = ",".join(vals)
+
+        # key:value pairs (Opening|YYYY):(number)
+        for m in re.finditer(r"\b(Opening|(?:19|20)\d{2})\s*[:=]\s*([0-9.]+)\b", blob, flags=re.I):
+            key = m.group(1)
+            val = float(m.group(2))
+            if key.lower() == "opening":
+                rates["Opening"] = val
+            else:
+                rates[int(key)] = val
+
+        # if still nothing, try to pick first bare number as Opening
+        if not rates:
+            m0 = re.search(r"\b([0-9]*\.?[0-9]+)\b", blob)
+            if m0:
+                rates["Opening"] = float(m0.group(1))
+
+    # safety defaults
+    if "Opening" not in rates:
+        rates["Opening"] = 0.0
+
+    # ---- figure out which year columns exist in PBT (Actual) ----
+    year_cols = []
+    for c in pbt_df.columns:
+        m = re.fullmatch(r"Actual\|(\d{4})", str(c))
+        if m:
+            year_cols.append(int(m.group(1)))
+    year_cols = sorted(year_cols)
+
+    # ---- build Tax rows: − rate * PBT(Actual) ----
+    out_rows = []
+    for _, r in pbt_df.iterrows():
+        entity = r["entity"]
+        cgu = r["business_line"]
+
+        row_out = {
+            "entity": entity,
+            "business_line": cgu,
+            "tax_rate": np.nan,  # per spec
+        }
+
+        # Opening
+        pbt_open = float(r.get("Actual|Opening", 0.0) or 0.0)
+        rate_open = float(rates.get("Opening", 0.0) or 0.0)
+        row_out["Opening"] = - rate_open * pbt_open
+
+        # Years
+        for y in year_cols:
+            pbt_val = float(r.get(f"Actual|{y}", 0.0) or 0.0)
+            rate_y = float(rates.get(y, 0.0) or 0.0)
+            row_out[y] = - rate_y * pbt_val
+
+        out_rows.append(row_out)
+
+    # Column order: entity, business_line, tax_rate, Opening, then dynamic years (ascending)
+    cols = ["entity", "business_line", "tax_rate", "Opening"] + year_cols
+    return pd.DataFrame(out_rows, columns=cols)
