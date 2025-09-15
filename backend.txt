@@ -1,57 +1,88 @@
-def sheet_saracen_in_thousand_LCY(ctx: Mapping[str, pd.DataFrame]) -> pd.DataFrame:
+def sheet_saracen_extra(ctx: Mapping[str, pd.DataFrame]) -> pd.DataFrame:
     """
-    Build the 'saracen (in thousand LCY)' sheet.
+    Build the 'saracen_extra' sheet.
 
-    Inputs (must be loaded in ctx):
-      - ctx["saracen"]      -> from folder 'saracen', file key 'Saracen', (first sheet used)
-      - ctx["user_input"]   -> 'user_input' sheet
+    Inputs expected in ctx:
+      - ctx["nfa"]             -> from folder 'nfa', key 'NFA', sheet 'Driller' (raw matrix)
+      - ctx["saracen"]         -> from folder 'saracen', key 'Saracen', (first sheet used) — needed for Goodwill total
+      - ctx["tangible_equity"] -> from folder 'tangible_equity', key 'RoTE', sheet 'ROTE Detail Valued' (to recompute TE ratios)
+      - ctx["user_input"]      -> 'user_input' sheet
 
-    Steps:
-      1) current_year from user_input.testing_date (MM/DD/YYYY).
-      2) entity from user_input.entity.
-      3) Find all columns that contain the current year (exact year match anywhere in col).
-      4) If multiple, look inside those columns for a month token like 'JAN-JAN', 'MAY-MAY', ...;
-         choose the column with the latest month.
-      5) Confirm the entity exists somewhere in the final value column (not strictly needed to read row values, but validated).
-      6) For each key in key_mapper, find the row by label (anywhere), read value at (row, final_col),
-         and build a dict of display_name -> numeric value.
-      7) Map each line item to 'tangible_equity' or 'CET_adjustments', and output rows:
-           entity | category | line_item | Amount
+    Output columns (one row per CGU):
+      entity | business_line | bank_premises_revaluation (in million LCY) |
+      saracen_goodwill (in million LCY) | saracen_intangible (in million LCY) |
+      pension_fund_assets (in million LCY) |
+      Goodwill and Intangible assets (in thousand LCY) |
+      CC allocation % (Goodwill and Intangible assets) |
+      Right-of-Use assets (RoU) (in thousand LCY) |
+      CC allocation % (Right-of-Use assets (RoU)) |
+      PPE (in thousand LCY) |
+      CC allocation % (PPE)
     """
     import re
     import numpy as np
     import pandas as pd
-    from utility import ui_to_kv
+    from utility import ui_to_kv, parse_cgu_rollup
 
-    # ---- inputs ----
-    df = ctx["saracen"]
+    # -------- helpers --------
+    def to_float(x) -> float:
+        if pd.isna(x):
+            return 0.0
+        s = str(x).strip().replace(",", "")
+        if s == "":
+            return 0.0
+        try:
+            return float(s)
+        except Exception:
+            return 0.0
+
+    def find_first(df_str: pd.DataFrame, target: str) -> tuple[int, int]:
+        """Find exact (case-insensitive) match anywhere; return (row, col)."""
+        hits = np.argwhere(df_str.values == target)
+        if hits.size:
+            return int(hits[0][0]), int(hits[0][1])
+        hits = np.argwhere(np.vectorize(lambda x: x.lower() == target.lower())(df_str.values))
+        if hits.size:
+            return int(hits[0][0]), int(hits[0][1])
+        raise ValueError(f"Label '{target}' not found.")
+
+    # -------- inputs --------
+    nfa = ctx["nfa"]                # "Driller" sheet
+    saracen = ctx["saracen"]        # for goodwill number
+    te_input_df = ctx["tangible_equity"]  # to recompute TE ratios
     ui = ctx["user_input"]
 
-    # ---- user_input -> current year + entity ----
+    # user_input basics
     kv = ui_to_kv(ui)
     entity = str(kv.get("entity", "")).strip()
+    rollup_expr = kv.get("cgu_rollup") or kv.get("cgu_rollups") or ""
+    cgus = parse_cgu_rollup(rollup_expr)  # ['Total','CIB','IWPB','CC'] order typically
 
-    # current_year from testing_date (MM/DD/YYYY)
+    # current year from testing_date — handle both 'YYYY-MM-DD 00:00:00' and 'MM/DD/YYYY'
     td = str(kv.get("testing_date", "")).strip()
-    m = re.search(r"(\d{1,2})/(\d{1,2})/(\d{4})", td)
-    if not m:
-        raise ValueError("testing_date not found or not in MM/DD/YYYY; required to derive current_year.")
-    current_year = int(m.group(3))
+    try:
+        current_year = pd.to_datetime(td, errors="coerce").year
+    except Exception:
+        current_year = None
+    if not current_year:
+        m = re.search(r"(\d{1,2})/(\d{1,2})/(\d{4})", td)
+        if not m:
+            raise ValueError(f"Cannot parse testing_date into a year: {td}")
+        current_year = int(m.group(3))
     y_str = str(current_year)
 
-    # ---- string view for matching ----
-    df_str = df.copy().applymap(lambda x: str(x).strip() if pd.notna(x) else "")
-
-    # 3) collect candidate year columns (any cell equals the year, tolerant for '1990.0')
+    # -------- 1) Goodwill number from Saracen (AR00001 - Goodwill and Intangible assets), divide by 100 --------
+    sar_str = saracen.copy().applymap(lambda x: str(x).strip() if pd.notna(x) else "")
+    # Re-use the same "final column" selection approach as in saracen sheet:
+    # Find all columns with the current year present
     candidate_cols = set()
-    arr = df_str.values
     # exact 'YYYY'
-    hits = np.argwhere(arr == y_str)
+    hits = np.argwhere(sar_str.values == y_str)
     for r, c in hits:
         candidate_cols.add(int(c))
     # numeric 'YYYY.0' etc.
-    for j in range(df_str.shape[1]):
-        col_vals = df_str.iloc[:, j]
+    for j in range(sar_str.shape[1]):
+        col_vals = sar_str.iloc[:, j]
         for val in col_vals:
             try:
                 if int(float(val)) == current_year:
@@ -60,96 +91,209 @@ def sheet_saracen_in_thousand_LCY(ctx: Mapping[str, pd.DataFrame]) -> pd.DataFra
             except Exception:
                 continue
     if not candidate_cols:
-        raise ValueError(f"No column containing year {current_year} found in Saracen sheet.")
-
-    # 4) if multiple, prefer the one with the latest 'MMM-MMM' month marker in that column
-    month_rank = {
-        "JAN": 1, "FEB": 2, "MAR": 3, "APR": 4, "MAY": 5, "JUN": 6,
-        "JUL": 7, "AUG": 8, "SEP": 9, "OCT": 10, "NOV": 11, "DEC": 12
-    }
-    def detect_month_score(col_idx: int) -> int:
-        # search for tokens like 'JAN-JAN', 'MAY - MAY' (allow spaces)
-        pat = re.compile(r"^(JAN|FEB|MAR|APR|MAY|JUN|JUL|AUG|SEP|OCT|NOV|DEC)\s*-\s*\1$", re.I)
-        for txt in df_str.iloc[:, col_idx]:
-            m = pat.match(txt)
-            if m:
-                return month_rank[m.group(1).upper()]
-        return 0  # no month marker
-
-    if len(candidate_cols) == 1:
-        final_col = next(iter(candidate_cols))
+        # if none, default to last column
+        final_col_sar = sar_str.shape[1] - 1
     else:
-        # pick the column with the highest month score; if equal, pick the rightmost
-        ranked = sorted(((detect_month_score(c), c) for c in candidate_cols))
-        # ranked is ascending; take the last (largest score), and if tie it picks the larger column index
-        final_col = ranked[-1][1]
-
-    # 5) confirm entity appears in final value column (case-insensitive contains or equals)
-    col_series = df_str.iloc[:, final_col]
-    ent_rows = col_series[col_series.str.lower() == entity.lower()].index.tolist()
-    if not ent_rows:
-        # allow containment
-        ent_rows = col_series[col_series.str.lower().str.contains(entity.lower(), na=False)].index.tolist()
-    # We don't strictly need entity_row to fetch amounts (we read rows by label keys), but validate presence
-    if not ent_rows:
-        # Not fatal, but helpful to know:
-        # raise ValueError(f"Entity '{entity}' not found in the final Saracen column.")
-        pass
-
-    # 6) key mapping: source label in sheet -> output line_item label
-    key_mapper = {
-        "E200000 - Total Shareholders Equity": "E100000 - Total Equity",
-        "LP00000 - Total Equity-Non_controlling interests": "LP00000 - Total Equity-Non_controlling interests",
-        "LQ10200 - EQ-Other Equity Instruments": "LQ10200 - EQ-Other Equity Instruments",
-        "AR81000 - G/W & IntangAsset-Other Intangibles": "AR00001- Goodwill and Intangible assets",
-        "LQ89400 - EQ-Property revaluation Reserve": "LQ89400 - EQ-Property revaluation Reserve",
-        "Foreseeable dividend (net of scrip)": "Foreseeable dividend (net of scrip)",
-        "LQ87800 - Own credit reserve": "Own credit spread and debit valuation adjustment",
-    }
-
-    # reverse category mapping for step 7
-    tangible_set = {
-        "E100000 - Total Equity",
-        "LP00000 - Total Equity-Non_controlling interests",
-        "LQ10200 - EQ-Other Equity Instruments",
-        "AR00001- Goodwill and Intangible assets",
-        "LQ89400 - EQ-Property revaluation Reserve",
-        "Foreseeable dividend (net of scrip)",
-    }
-    cet_adj_set = {"Own credit spread and debit valuation adjustment"}
-
-    def to_float(x) -> float:
-        if pd.isna(x):
-            return 0.0
-        s = str(x).strip()
-        if s == "":
-            return 0.0
-        try:
-            return float(s.replace(",", ""))  # handle thousands separators if any
-        except Exception:
-            return 0.0
-
-    # For each source key, find its row anywhere; take value at (row, final_col)
-    rows_out = []
-    for src_label, out_label in key_mapper.items():
-        # locate row by label (exact, case-insensitive fallback)
-        hits = np.argwhere(df_str.values == src_label)
-        if hits.size == 0:
-            hits = np.argwhere(np.vectorize(lambda x: x.lower() == src_label.lower())(df_str.values))
-        if hits.size == 0:
-            # If not found, record zero
-            amount = 0.0
+        month_rank = {
+            "JAN": 1, "FEB": 2, "MAR": 3, "APR": 4, "MAY": 5, "JUN": 6,
+            "JUL": 7, "AUG": 8, "SEP": 9, "OCT": 10, "NOV": 11, "DEC": 12
+        }
+        def detect_month_score(col_idx: int) -> int:
+            pat = re.compile(r"^(JAN|FEB|MAR|APR|MAY|JUN|JUL|AUG|SEP|OCT|NOV|DEC)\s*-\s*\1$", re.I)
+            for txt in sar_str.iloc[:, col_idx]:
+                m = pat.match(txt)
+                if m:
+                    return month_rank[m.group(1).upper()]
+            return 0
+        if len(candidate_cols) == 1:
+            final_col_sar = next(iter(candidate_cols))
         else:
-            row_idx = int(hits[0][0])
-            amount = to_float(df.iat[row_idx, final_col])
+            ranked = sorted(((detect_month_score(c), c) for c in candidate_cols))
+            final_col_sar = ranked[-1][1]
 
-        category = "tangible_equity" if out_label in tangible_set else "CET_adjustments" if out_label in cet_adj_set else "tangible_equity"
-        rows_out.append({
+    # Find the row for "AR00001 - Goodwill and Intangible assets" (tolerate minor dash/space differences)
+    # We'll try a few variants:
+    goodwill_labels = [
+        "AR00001 - Goodwill and Intangible assets",
+        "AR00001- Goodwill and Intangible assets",
+        "AR00001 - Goodwill & Intangible assets",
+        "AR00001- Goodwill & Intangible assets",
+        "AR00001",  # last resort
+    ]
+    goodwill_row = None
+    for lab in goodwill_labels:
+        hits = np.argwhere(sar_str.values == lab)
+        if hits.size == 0:
+            hits = np.argwhere(np.vectorize(lambda x: x.lower() == lab.lower())(sar_str.values))
+        if hits.size:
+            goodwill_row = int(hits[0][0])
+            break
+    goodwill_number = to_float(saracen.iat[goodwill_row, final_col_sar]) if goodwill_row is not None else 0.0
+    # Divide by 100 as per your instruction (producing "in million LCY" per spec)
+    goodwill_million = goodwill_number / 100.0
+
+    # -------- 2) TE ratios (recompute like sheet_tangible_equity) --------
+    te_str = te_input_df.copy().applymap(lambda x: str(x).strip() if pd.notna(x) else "")
+
+    # Find entity row in TE sheet
+    pos_ent = np.argwhere(te_str.values == entity)
+    if pos_ent.size == 0:
+        pos_ent = np.argwhere(np.vectorize(lambda x: x.lower() == entity.lower())(te_str.values))
+    if pos_ent.size == 0:
+        raise ValueError(f"Entity '{entity}' not found in tangible_equity input.")
+    entity_row_idx = int(pos_ent[0][0])
+
+    def find_label_col(label: str) -> int:
+        """Return first column index where the label occurs anywhere."""
+        hits = np.argwhere(te_str.values == label)
+        if hits.size:
+            return int(hits[0][1])
+        hits = np.argwhere(np.vectorize(lambda x: x.lower() == label.lower())(te_str.values))
+        if hits.size:
+            return int(hits[0][1])
+        raise ValueError(f"Label '{label}' not found in tangible_equity input.")
+
+    te_vals: dict[str, float] = {}
+    for cgu in cgus:
+        cgu_new = "Corp Centre" if cgu == "CC" else cgu
+        variable = "Spot TE" if cgu_new == "Total" else f"{cgu_new} TE Spot"
+        col_idx = find_label_col(variable)
+        te_vals[cgu] = to_float(te_input_df.iat[entity_row_idx, col_idx])
+
+    te_total = te_vals.get("Total", 0.0)
+    te_ratio = {k: (v / te_total if te_total else 0.0) for k, v in te_vals.items()}
+
+    # -------- 3) saracen_intangible (in million LCY) per CGU --------
+    saracen_intangible_million = {cgu: goodwill_million * te_ratio.get(cgu, 0.0) for cgu in cgus}
+
+    # -------- 4–6) NFA "Driller": find latest month column among current-year columns, then find CGU column indices --------
+    nfa_str = nfa.copy().applymap(lambda x: str(x).strip() if pd.notna(x) else "")
+
+    # current-year candidate columns
+    candidate_cols_nfa = set()
+    hits = np.argwhere(nfa_str.values == y_str)
+    for r, c in hits:
+        candidate_cols_nfa.add(int(c))
+    for j in range(nfa_str.shape[1]):
+        col_vals = nfa_str.iloc[:, j]
+        for val in col_vals:
+            try:
+                if int(float(val)) == current_year:
+                    candidate_cols_nfa.add(j)
+                    break
+            except Exception:
+                continue
+    if not candidate_cols_nfa:
+        # fallback to last column
+        final_col_nfa = nfa_str.shape[1] - 1
+        latest_cols = [final_col_nfa]
+    else:
+        # pick all columns with a month token, then choose those with the latest month
+        month_rank = {
+            "JAN": 1, "FEB": 2, "MAR": 3, "APR": 4, "MAY": 5, "JUN": 6,
+            "JUL": 7, "AUG": 8, "SEP": 9, "OCT": 10, "NOV": 11, "DEC": 12
+        }
+        pat = re.compile(r"^(JAN|FEB|MAR|APR|MAY|JUN|JUL|AUG|SEP|OCT|NOV|DEC)\s*-\s*\1$", re.I)
+        scored = []
+        for c in candidate_cols_nfa:
+            score = 0
+            for txt in nfa_str.iloc[:, c]:
+                m = pat.match(txt)
+                if m:
+                    score = month_rank[m.group(1).upper()]
+                    break
+            scored.append((score, c))
+        if scored:
+            max_score = max(s for s, _ in scored)
+            latest_cols = [c for s, c in scored if s == max_score and s > 0]
+            if not latest_cols:  # if none had month markers, just use the rightmost candidate
+                latest_cols = [max(candidate_cols_nfa)]
+        else:
+            latest_cols = [max(candidate_cols_nfa)]
+
+    # Among latest columns, find where CGU markers appear
+    cgu_map = {"GB_Total": "Total", "IWB": "IWPB", "CIB": "CIB", "OTH": "CC"}
+    cgu_val_col: dict[str, int] = {}  # logical CGU -> column index
+    for code, logical in cgu_map.items():
+        # search in any of the latest cols for this code text
+        found_col = None
+        for c in latest_cols:
+            col_txts = nfa_str.iloc[:, c]
+            if any(code.lower() == t.lower() for t in col_txts):
+                found_col = c
+                break
+        # if not found, search exact anywhere and prefer if its column is in latest_cols
+        if found_col is None:
+            hits = np.argwhere(nfa_str.values == code)
+            if hits.size:
+                # prefer a hit whose col is in latest_cols, otherwise take first
+                cols = [int(col) for _, col in hits]
+                inter = [col for col in cols if col in latest_cols]
+                found_col = inter[0] if inter else cols[0]
+        if found_col is not None:
+            cgu_val_col[logical] = found_col
+
+    # -------- 7–8) label column for "G/W & Intang" then rows for Software / ROU / PPE --------
+    try:
+        _r, label_col = find_first(nfa_str, "G/W & Intang")
+    except Exception:
+        # some files use 'G/W & Intangibles'
+        _r, label_col = find_first(nfa_str, "G/W & Intangibles")
+
+    def find_row(label: str) -> int:
+        hits = np.argwhere(nfa_str.values == label)
+        if hits.size:
+            return int(hits[0][0])
+        hits = np.argwhere(np.vectorize(lambda x: x.lower() == label.lower())(nfa_str.values))
+        if hits.size:
+            return int(hits[0][0])
+        # also allow substring match within that label column
+        series = nfa_str.iloc[:, label_col].str.lower()
+        idxs = series[series.str.contains(label.lower(), na=False)].index.tolist()
+        if idxs:
+            return int(idxs[0])
+        raise ValueError(f"Row label '{label}' not found in NFA sheet.")
+
+    row_software = find_row("Software")
+    row_rou      = find_row("ROU")
+    row_ppe      = find_row("PPE")
+
+    # -------- 9) build rows per CGU --------
+    rows = []
+    for logical in ["Total", "CIB", "IWPB", "CC"]:
+        col_idx = cgu_val_col.get(logical)
+        # per-CGU values from NFA (in thousand LCY)
+        sw  = to_float(nfa.iat[row_software, col_idx]) if col_idx is not None else 0.0
+        rou = to_float(nfa.iat[row_rou,      col_idx]) if col_idx is not None else 0.0
+        ppe = to_float(nfa.iat[row_ppe,      col_idx]) if col_idx is not None else 0.0
+
+        rows.append({
             "entity": entity,
-            "category": category,
-            "line_item": out_label,
-            "Amount": amount,
+            "business_line": logical,
+            "bank_premises_revaluation (in million LCY)": 0.0,
+            "saracen_goodwill (in million LCY)": 0.0,
+            "saracen_intangible (in million LCY)": saracen_intangible_million.get(logical, 0.0),
+            "pension_fund_assets (in million LCY)": 0.0,
+            "Goodwill and Intangible assets (in thousand LCY)": sw,
+            "CC allocation % (Goodwill and Intangible assets)": 0.0,
+            "Right-of-Use assets (RoU) (in thousand LCY)": rou,
+            "CC allocation % (Right-of-Use assets (RoU))": 0.0,
+            "PPE (in thousand LCY)": ppe,
+            "CC allocation % (PPE)": 0.0,
         })
 
-    # Output as a DataFrame
-    return pd.DataFrame(rows_out, columns=["entity", "category", "line_item", "Amount"])
+    cols = [
+        "entity",
+        "business_line",
+        "bank_premises_revaluation (in million LCY)",
+        "saracen_goodwill (in million LCY)",
+        "saracen_intangible (in million LCY)",
+        "pension_fund_assets (in million LCY)",
+        "Goodwill and Intangible assets (in thousand LCY)",
+        "CC allocation % (Goodwill and Intangible assets)",
+        "Right-of-Use assets (RoU) (in thousand LCY)",
+        "CC allocation % (Right-of-Use assets (RoU))",
+        "PPE (in thousand LCY)",
+        "CC allocation % (PPE)",
+    ]
+    return pd.DataFrame(rows, columns=cols)
