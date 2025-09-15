@@ -1,98 +1,162 @@
-        # Encrypted or uncertain: prompt and attempt decrypt-to-temp
+def read_tablelike_any(
+    path: Union[str, Path],
+    sheet_name: Optional[Union[str, int]] = None,
+    password: Optional[str] = None,
+    password_provider: Optional[PasswordProvider] = None,
+    max_tries: int = 3,
+    report: Optional[ProgressReporter] = None,
+) -> Dict[str, pd.DataFrame]:
+    """
+    Generalized reader:
+      - Excel (.xlsx/.xlsm/.xls/.xlsb): returns all sheets as {sheet_name: DataFrame}
+        (or single {name: df} if sheet_name is specified).
+      - CSV/TSV: returns {file_stem: DataFrame}.
+
+    If encrypted, uses `password` or calls `password_provider(filename)` up to max_tries.
+    Only re-prompts for InvalidKeyError (wrong password). Post-decrypt read errors do NOT re-prompt.
+    """
+    path = Path(path)
+    ext = path.suffix.lower()
+
+    # Text formats first
+    if ext in SUPPORTED_TEXT_EXTS:
+        df = _read_csv_like(path)
+        return {path.stem: df}
+
+    if ext not in SUPPORTED_EXCEL_EXTS:
+        raise ValueError(
+            f"Unsupported file type: {ext}. "
+            f"Supported: {', '.join(sorted(SUPPORTED_TEXT_EXTS | SUPPORTED_EXCEL_EXTS))}"
+        )
+
+    def _normalize_return(dfs_obj):
+        # Pandas returns a DataFrame if a specific sheet_name is given;
+        # normalize to {name: df} for consistency.
+        if isinstance(dfs_obj, pd.DataFrame):
+            return {str(sheet_name): dfs_obj}
+        return dfs_obj
+
+    # Choose engine for the original (non-encrypted) file
+    engine = _pick_engine(ext)
+
+    # Fast path: try to read directly (non-encrypted)
+    try:
+        dfs = pd.read_excel(
+            path,
+            sheet_name=None if sheet_name is None else sheet_name,
+            engine=engine
+        )
+        return _normalize_return(dfs)
+    except Exception as orig_err:
+        enc_guess = _is_probably_encrypted_excel(path)
+        if enc_guess is False:
+            # Not encrypted by our checks → propagate original error
+            raise
+
+        # Encrypted (or uncertain): prompt and decrypt to temp, then read the decrypted payload.
+        def _sniff_engine_for_decrypted(tmp_path: Union[str, Path]) -> str:
+            """
+            Pick engine using the decrypted file's signature, not the original extension.
+            - ZIP (PK..) → openpyxl
+            - OLE/BIFF .xlsb → pyxlsb
+            - OLE/BIFF .xls  → xlrd (requires xlrd<2.0)
+            Fallback default: openpyxl
+            """
+            p = Path(tmp_path)
+            sig = _file_signature(p)
+            # OOXML payloads are plain ZIPs
+            if sig.startswith(b"PK"):
+                return "openpyxl"
+            # Otherwise OLE container; prefer xlsb if either suffix hints xlsb
+            if p.suffix.lower() == ".xlsb" or path.suffix.lower() == ".xlsb":
+                return "pyxlsb"
+            if p.suffix.lower() == ".xls" or path.suffix.lower() == ".xls":
+                return "xlrd"
+            # Default to OOXML reader
+            return "openpyxl"
+
         tries = 0
-        last_err = None
+        last_err: Optional[Exception] = None
+
         while tries < max_tries:
-            pw = password or getpass(f"Enter OPEN password for '{path.name}': ")
+            # Get a password (param > provider > CLI prompt)
+            pw = password
+            if pw is None and password_provider is not None:
+                try:
+                    pw = password_provider(path.name)
+                except Exception:
+                    pw = None
+            if pw is None:
+                pw = getpass(f"Enter OPEN password for '{path.name}': ")
+
+            tmp_name = None
             try:
+                # Decrypt to temp file
                 tmp_name = _decrypt_to_temp(path, pw)
 
-                # ---- PICK ENGINE FOR THE *DECRYPTED* PAYLOAD, NOT ORIGINAL EXT ----
-                # Re-sniff signature to choose engine robustly
-                def _sniff_and_pick_engine(tmp_path: str) -> str:
-                    p = Path(tmp_path)
-                    sig = _file_signature(p)
-                    # OOXML: ZIP starts with PK
-                    if sig.startswith(b"PK"):
-                        return "openpyxl"   # .xlsx/.xlsm-like payload
-                    # Otherwise, OLE container. Choose based on original ext hint:
-                    if p.suffix.lower() == ".xlsb" or path.suffix.lower() == ".xlsb":
-                        return "pyxlsb"
-                    if p.suffix.lower() == ".xls" or path.suffix.lower() == ".xls":
-                        return "xlrd"      # requires xlrd<2.0 for .xls
-                    # As a safe default, try openpyxl first, then pyxlsb
-                    return "openpyxl"
+                # Pick engine for the decrypted payload
+                dec_engine = _sniff_engine_for_decrypted(tmp_name)
 
-                dec_engine = _sniff_and_pick_engine(tmp_name)
-
-                try:
-                    # Try the detected engine first
-                    dfs = pd.read_excel(
+                # Try dec_engine, then engine=None, then explicit fallbacks
+                def _try_read(eng: Optional[str]):
+                    return pd.read_excel(
                         tmp_name,
                         sheet_name=None if sheet_name is None else sheet_name,
-                        engine=dec_engine
+                        engine=eng
                     )
+
+                try:
+                    dfs = _try_read(dec_engine)
                 except Exception as read_err:
-                    # Small fallback set: let pandas choose (engine=None), then alt engines
-                    fallbacks = []
-                    if dec_engine != "openpyxl":
-                        fallbacks.append("openpyxl")
-                    if dec_engine != "pyxlsb":
-                        fallbacks.append("pyxlsb")
-                    if dec_engine != "xlrd":
-                        fallbacks.append("xlrd")
-                    # Try pandas autodetect (engine=None) first
+                    # Try pandas autodetect (engine=None)
                     try:
-                        dfs = pd.read_excel(
-                            tmp_name,
-                            sheet_name=None if sheet_name is None else sheet_name,
-                            engine=None
-                        )
+                        dfs = _try_read(None)
                     except Exception:
-                        # Iterate explicit fallbacks
+                        # Try a small set of alternative engines
+                        fallback_engs = []
+                        for e in ("openpyxl", "pyxlsb", "xlrd"):
+                            if e != dec_engine:
+                                fallback_engs.append(e)
                         last_read_err = read_err
                         dfs = None
-                        for eng in fallbacks:
+                        for eng in fallback_engs:
                             try:
-                                dfs = pd.read_excel(
-                                    tmp_name,
-                                    sheet_name=None if sheet_name is None else sheet_name,
-                                    engine=eng
-                                )
+                                dfs = _try_read(eng)
                                 last_read_err = None
                                 break
                             except Exception as e2:
                                 last_read_err = e2
                         if dfs is None:
                             raise RuntimeError(
-                                f"Decrypted '{path.name}' but failed to read it with any engine "
-                                f"(tried '{dec_engine}', autodetect, and fallbacks). "
+                                f"Decrypted '{path.name}' but failed to read it "
+                                f"(tried engine='{dec_engine}', autodetect, and fallbacks). "
                                 f"Last error: {last_read_err}"
                             ) from last_read_err
 
-                # If a specific sheet_name was passed, pandas may return a single DataFrame
-                if isinstance(dfs, pd.DataFrame):
-                    dfs = {str(sheet_name): dfs}
+                # Success: normalize and return
+                return _normalize_return(dfs)
 
-                return dfs
-
-            except InvalidKeyError as e:
-                # ONLY wrong password should re-prompt
-                print("Password incorrect. Please try again.", file=sys.stderr)
-                last_err = e
-                password = None
+            except InvalidKeyError as e_bad_pw:
+                # Wrong password → count a try and re-prompt only for this case
                 tries += 1
-            except Exception as e_dec:
-                # Any non-password failure after decrypt MUST NOT re-prompt
+                last_err = e_bad_pw
+                password = None  # clear so we fetch it again
+                if report:
+                    report(f"Password attempt {tries} failed for {path.name}.")
+                continue
+            except Exception as e_after_decrypt:
+                # Any non-password error after decrypt is NOT a reason to re-prompt
                 raise RuntimeError(
-                    f"Failed to open '{path.name}' after decrypt: {e_dec}"
-                ) from e_dec
+                    f"Failed to open '{path.name}' after decrypt: {e_after_decrypt}"
+                ) from e_after_decrypt
             finally:
-                try:
-                    if 'tmp_name' in locals() and tmp_name:
+                if tmp_name:
+                    try:
                         os.remove(tmp_name)
-                except OSError:
-                    pass
+                    except OSError:
+                        pass
 
+        # Exhausted attempts with wrong passwords
         raise InvalidKeyError(
             f"Failed to open '{path.name}' after {max_tries} attempts (wrong password)."
         ) from last_err
