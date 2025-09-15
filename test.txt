@@ -1,46 +1,98 @@
-import pandas as pd
-from backend import process_discount_rate
+        # Encrypted or uncertain: prompt and attempt decrypt-to-temp
+        tries = 0
+        last_err = None
+        while tries < max_tries:
+            pw = password or getpass(f"Enter OPEN password for '{path.name}': ")
+            try:
+                tmp_name = _decrypt_to_temp(path, pw)
 
-# ---- Mock input dataframe (like "CoE rates.xlsx") ----
-data = {
-    "Entity": ["", "", "Entity", "", ""],
-    "Group": ["", "", "CoE LCY", "", ""],
-    "IWPB": ["", "", "", "CoE LCY", ""],
-    "CIB": ["", "", "", "", "CoE LCY"],
-    "CC": ["", "", "", "", ""],
-    "HBME - United Arab Emirates": ["", "", 0.05, 0.06, 0.07],
-}
-df = pd.DataFrame(data)
+                # ---- PICK ENGINE FOR THE *DECRYPTED* PAYLOAD, NOT ORIGINAL EXT ----
+                # Re-sniff signature to choose engine robustly
+                def _sniff_and_pick_engine(tmp_path: str) -> str:
+                    p = Path(tmp_path)
+                    sig = _file_signature(p)
+                    # OOXML: ZIP starts with PK
+                    if sig.startswith(b"PK"):
+                        return "openpyxl"   # .xlsx/.xlsm-like payload
+                    # Otherwise, OLE container. Choose based on original ext hint:
+                    if p.suffix.lower() == ".xlsb" or path.suffix.lower() == ".xlsb":
+                        return "pyxlsb"
+                    if p.suffix.lower() == ".xls" or path.suffix.lower() == ".xls":
+                        return "xlrd"      # requires xlrd<2.0 for .xls
+                    # As a safe default, try openpyxl first, then pyxlsb
+                    return "openpyxl"
 
-# ---- Mock user_input dataframe (like "user_input.xlsx") ----
-user_input_data = {
-    "Field": [
-        "entity",
-        "look_ahead",
-        "testing_date",
-        "current_year",
-        "TOR",
-        "cgu_rollup",
-        "exclude_cgu_fcfe",
-        "treat_current_year_as_historic",
-        "CET1_required (in decimal)",
-    ],
-    "Value": [
-        "5300_1GRT - HSBC Bank Middle East",
-        7,
-        "5/31/2025",
-        2025,
-        1,
-        "Total=CIB+IWPB+CC",
-        "CC",
-        "N",
-        0.1017,
-    ],
-}
-user_input_df = pd.DataFrame(user_input_data)
+                dec_engine = _sniff_and_pick_engine(tmp_name)
 
-# ---- Run the processing function ----
-result = process_discount_rate(df, user_input_df)
+                try:
+                    # Try the detected engine first
+                    dfs = pd.read_excel(
+                        tmp_name,
+                        sheet_name=None if sheet_name is None else sheet_name,
+                        engine=dec_engine
+                    )
+                except Exception as read_err:
+                    # Small fallback set: let pandas choose (engine=None), then alt engines
+                    fallbacks = []
+                    if dec_engine != "openpyxl":
+                        fallbacks.append("openpyxl")
+                    if dec_engine != "pyxlsb":
+                        fallbacks.append("pyxlsb")
+                    if dec_engine != "xlrd":
+                        fallbacks.append("xlrd")
+                    # Try pandas autodetect (engine=None) first
+                    try:
+                        dfs = pd.read_excel(
+                            tmp_name,
+                            sheet_name=None if sheet_name is None else sheet_name,
+                            engine=None
+                        )
+                    except Exception:
+                        # Iterate explicit fallbacks
+                        last_read_err = read_err
+                        dfs = None
+                        for eng in fallbacks:
+                            try:
+                                dfs = pd.read_excel(
+                                    tmp_name,
+                                    sheet_name=None if sheet_name is None else sheet_name,
+                                    engine=eng
+                                )
+                                last_read_err = None
+                                break
+                            except Exception as e2:
+                                last_read_err = e2
+                        if dfs is None:
+                            raise RuntimeError(
+                                f"Decrypted '{path.name}' but failed to read it with any engine "
+                                f"(tried '{dec_engine}', autodetect, and fallbacks). "
+                                f"Last error: {last_read_err}"
+                            ) from last_read_err
 
-print("Output dictionary:")
-print(result)
+                # If a specific sheet_name was passed, pandas may return a single DataFrame
+                if isinstance(dfs, pd.DataFrame):
+                    dfs = {str(sheet_name): dfs}
+
+                return dfs
+
+            except InvalidKeyError as e:
+                # ONLY wrong password should re-prompt
+                print("Password incorrect. Please try again.", file=sys.stderr)
+                last_err = e
+                password = None
+                tries += 1
+            except Exception as e_dec:
+                # Any non-password failure after decrypt MUST NOT re-prompt
+                raise RuntimeError(
+                    f"Failed to open '{path.name}' after decrypt: {e_dec}"
+                ) from e_dec
+            finally:
+                try:
+                    if 'tmp_name' in locals() and tmp_name:
+                        os.remove(tmp_name)
+                except OSError:
+                    pass
+
+        raise InvalidKeyError(
+            f"Failed to open '{path.name}' after {max_tries} attempts (wrong password)."
+        ) from last_err
