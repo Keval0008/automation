@@ -1,286 +1,34 @@
-def sheet_Latest_FRP_PBT_in_million_LCY(ctx: Mapping[str, pd.DataFrame]) -> pd.DataFrame:
-    """
-    Build 'Latest_FRP_PBT (in million LCY)'.
+# Find all candidate columns for this target year
+def has_year(col: int, y: int) -> bool:
+    col_vals = df_str.iloc[:, col].tolist()
+    for txt in col_vals:
+        yy = year_from_any(txt)
+        if yy == y:
+            return True
+    return False
 
-    Needs:
-      - ctx["user_input"] sheet 'rwa_pbt_mapper' (we'll re-open it from disk to get that sheet)
-      - files in subfolder 'pbt' matched by mapper's 'filename keyword'
-      - For 'mimosa': sheet 'Sumpl_GB_Mimosa 1'
-      - For others: CGU sheets 'Total','CIB','IWPB','CC'
-    Output: rows per CGU with columns:
-      entity | business_line |
-      Actual|Opening | Actual|{years...} |
-      Overlays|Opening | Overlays|{years...}
-    """
-    import re
-    import numpy as np
-    import pandas as pd
-    from utility import (
-        PipelineConfig, discover_files, pick_file_by_keyword, read_tablelike_any,
-        ui_to_kv, parse_cgu_rollup
-    )
+def matches_type_selector(col: int, typ: str) -> bool:
+    col_vals = [str(v).strip() for v in df_str.iloc[:, col].tolist()]
+    t = (typ or "").strip().lower()
+    if t in ("forcasted", "actual"):  # mapper uses 'forcasted' spelling
+        # exact 'Fcst'
+        return any(v == "Fcst" for v in col_vals)
+    elif t == "budgeted":
+        # substring 'Budget' (case-insensitive)
+        return any("budget" in v.lower() for v in col_vals)
+    else:
+        # default fallback: accept anything (we'll still filter by year)
+        return True
 
-    # ---- helpers ----
-    def to_float(x) -> float:
-        if pd.isna(x): return 0.0
-        s = str(x).strip().replace(",", "")
-        if not s: return 0.0
-        try: return float(s)
-        except: return 0.0
+# Choose column for this (cgu, year, typ)
+candidates = [c for c in yr_cols if has_year(c, y)]
+col_choice = None
+# Prefer candidates that satisfy the type selector
+prio = [c for c in candidates if matches_type_selector(c, typ)]
+if prio:
+    col_choice = prio[0]
+elif candidates:
+    col_choice = candidates[0]
 
-    def year_from_any(s: str) -> int | None:
-        try:
-            y = pd.to_datetime(s, errors="coerce").year
-            return int(y) if pd.notna(y) else None
-        except Exception:
-            pass
-        m = re.search(r"\b(19|20)\d{2}\b", str(s))
-        return int(m.group(0)) if m else None
-
-    def open_user_sheet(sheet_name: str) -> pd.DataFrame:
-        """Re-open user_input workbook to read a specific sheet (e.g., 'rwa_pbt_mapper')."""
-        cfg: PipelineConfig = ctx["_cfg"]
-        files = discover_files(cfg, subfolder="user_input")
-        f = pick_file_by_keyword(files, "user_input", True, cfg.multi_match_policy)
-        if not f:
-            raise FileNotFoundError("user_input file not found for 'rwa_pbt_mapper'.")
-        dfs = read_tablelike_any(f, sheet_name=sheet_name)
-        # read_tablelike_any returns {name: df} if sheet_name set
-        df = next(iter(dfs.values()))
-        return df
-
-    def open_pbt_book(keyword: str) -> dict[str, pd.DataFrame]:
-        cfg: PipelineConfig = ctx["_cfg"]
-        files = discover_files(cfg, subfolder="pbt")
-        f = pick_file_by_keyword(files, keyword, True, cfg.multi_match_policy)
-        if not f:
-            raise FileNotFoundError(f"PBT file not found for keyword '{keyword}'")
-        return read_tablelike_any(f)  # all sheets
-
-    def first_match_pos(df_str: pd.DataFrame, pred) -> tuple[int,int] | None:
-        arr = df_str.values
-        for i in range(arr.shape[0]):
-            for j in range(arr.shape[1]):
-                try:
-                    if pred(arr[i, j]): return (i, j)
-                except Exception:
-                    continue
-        return None
-
-    def find_row_equals(df_str: pd.DataFrame, text: str) -> int | None:
-        t = text.strip().lower()
-        hits = np.argwhere(np.vectorize(lambda x: str(x).strip().lower() == t)(df_str.values))
-        return int(hits[0][0]) if hits.size else None
-
-    def find_row_contains(df_str: pd.DataFrame, text: str) -> int | None:
-        t = text.strip().lower()
-        hits = np.argwhere(np.vectorize(lambda x: t in str(x).strip().lower())(df_str.values))
-        return int(hits[0][0]) if hits.size else None
-
-    # ---- basics from user_input ----
-    ui = ctx["user_input"]
-    kv = ui_to_kv(ui)
-    entity = str(kv.get("entity", "")).strip()
-    rollup_expr = kv.get("cgu_rollup") or kv.get("cgu_rollups") or ""
-    cgus = parse_cgu_rollup(rollup_expr)
-    # Ensure canonical CGU order / presence
-    cgus = [x for x in ["Total","CIB","IWPB","CC"] if x in set(cgus)]
-
-    # Read mapper sheet
-    mapper = open_user_sheet("rwa_pbt_mapper")
-    cols = {c.strip().lower(): c for c in mapper.columns.map(str)}
-    need = ["mapping","year","filename keyword","type"]
-    missing = [k for k in need if k not in cols]
-    if missing: raise KeyError(f"Missing columns in rwa_pbt_mapper: {missing}")
-    df_map = mapper.rename(columns={cols["mapping"]:"mapping",
-                                    cols["year"]:"year",
-                                    cols["filename keyword"]:"filename keyword",
-                                    cols["type"]:"type"})
-    df_map = df_map[df_map["mapping"].astype(str).str.strip().str.lower() == "pbt"].copy()
-
-    # Collect unique years and rows
-    def as_int(y):
-        try: return int(float(y))
-        except: 
-            yi = year_from_any(str(y)); 
-            if yi is None: raise
-            return yi
-
-    entries = []
-    for _, r in df_map.iterrows():
-        try:
-            y = as_int(r["year"])
-        except Exception:
-            continue
-        entries.append({
-            "year": y,
-            "keyword": str(r["filename keyword"]).strip(),
-            "type": str(r["type"]).strip().lower(),
-        })
-    if not entries:
-        # No mappings -> empty result with headers
-        cols_out = (["entity","business_line","Actual|Opening"]
-                    + []
-                    + ["Overlays|Opening"])
-        return pd.DataFrame(columns=cols_out)
-
-    years_sorted = sorted(sorted({e["year"] for e in entries}))
-    # Opening year (if we have a mimosa row → use that year as opening base)
-    opening_entry = next((e for e in entries if "mimosa" in e["keyword"].lower()), None)
-    opening_year = opening_entry["year"] if opening_entry else None
-
-    # ---- storage ----
-    # values[year][cgu] = value (float, in million LCY expected per inputs)
-    values: dict[int, dict[str, float]] = {y: {cgu: 0.0 for cgu in cgus} for y in years_sorted}
-    opening_dict = {cgu: 0.0 for cgu in cgus}
-
-    # ---- process each entry ----
-    for e in entries:
-        y = e["year"]; kw = e["keyword"]; typ = e["type"]
-        book = open_pbt_book(kw)
-
-        if "mimosa" in kw.lower():
-            # 4) Mimosa logic on 'Sumpl_GB_Mimosa 1'
-            sheet_name = None
-            # find sheet closest to target even if name variant exists
-            for s in book.keys():
-                if "sumpl_gb_mimosa 1".lower() == s.strip().lower():
-                    sheet_name = s; break
-            if sheet_name is None:
-                # loose search
-                sheet_name = next((s for s in book if "mimosa" in s.lower()), None)
-            if sheet_name is None:
-                raise KeyError("Could not find sheet 'Sumpl_GB_Mimosa 1' in Mimosa workbook")
-
-            df = book[sheet_name]
-            df_str = df.copy().applymap(lambda x: str(x).strip() if pd.notna(x) else "")
-
-            # 4A) CGU columns by substring
-            cgu_map = {
-                "International Wealth and Personal Banking": "IWPB",
-                "Corporate and Institutional Banking": "CIB",
-                "Corporate Centre": "CC",
-            }
-            value_cols: dict[str, int] = {}
-            for col_idx in range(df_str.shape[1]):
-                col_txts = " ".join(df_str.iloc[:, col_idx].astype(str).tolist()).lower()
-                for key, logical in cgu_map.items():
-                    if logical in value_cols:  # already set
-                        continue
-                    if key.lower() in col_txts:
-                        value_cols[logical] = col_idx
-
-            # 4B) value row by substring "Profit Before Tax"
-            row_pbt = find_row_contains(df_str, "Profit Before Tax")
-            if row_pbt is None:
-                raise ValueError("Row containing 'Profit Before Tax' not found in Mimosa sheet.")
-
-            # 4C) values per CGU and Total
-            total_val = 0.0
-            for logical in ["CIB","IWPB","CC"]:
-                col_idx = value_cols.get(logical)
-                v = to_float(df.iat[row_pbt, col_idx]) if col_idx is not None else 0.0
-                values[y][logical] = v
-                total_val += v
-            values[y]["Total"] = total_val
-
-            # Treat Mimosa year as opening base
-            opening_dict.update(values[y])
-            continue
-
-        # 5) Other files
-        # Depending on type: we only have 'forecasted' rule now
-        # Sheets per CGU
-        for cgu in cgus:
-            # get sheet by exact match or case-insensitive
-            sheet = None
-            for s in book.keys():
-                if s.strip().lower() == cgu.lower():
-                    sheet = s; break
-            if sheet is None:
-                # try variants e.g., 'Corp Centre' for CC if present
-                if cgu == "CC":
-                    var = next((s for s in book if "corp" in s.lower() and "centre" in s.lower()), None)
-                    sheet = var
-            if sheet is None:
-                continue  # skip if sheet missing
-
-            df = book[sheet]
-            df_str = df.copy().applymap(lambda x: str(x).strip() if pd.notna(x) else "")
-
-            # 5C) find "Full Year Trend" exact cells on some row,
-            # take contiguous run to the right while the same text repeats
-            pos = first_match_pos(df_str, lambda x: str(x).strip() == "Full Year Trend")
-            if not pos:
-                # allow case-insensitive exact
-                pos = first_match_pos(df_str, lambda x: str(x).strip().lower() == "full year trend")
-            if not pos:
-                continue  # cannot extract for this CGU/sheet
-            row_idx, start_col = pos
-            end_col = start_col
-            while end_col + 1 < df_str.shape[1] and df_str.iat[row_idx, end_col + 1].strip().lower() == "full year trend":
-                end_col += 1
-            # range where years should appear
-            yr_cols = list(range(start_col, end_col + 1))
-
-            # 5D) within that range, pick columns whose column text (somewhere) has the target year
-            # 5E) in those, pick the one where some cell equals 'Fcst'
-            # 5F) row 'Profit Before Tax'
-            row_pbt = find_row_equals(df_str, "Profit Before Tax")
-            if row_pbt is None:
-                row_pbt = find_row_contains(df_str, "Profit Before Tax")
-            if row_pbt is None:
-                continue
-
-            # Find all candidate columns for this target year
-            # We search for an exact 'YYYY' token anywhere in that column
-            def has_year(col: int, y: int) -> bool:
-                col_vals = df_str.iloc[:, col].tolist()
-                for txt in col_vals:
-                    yy = year_from_any(txt)
-                    if yy == y:
-                        return True
-                return False
-
-            # Among year columns, prefer one that has an exact 'Fcst'
-            def has_fcst(col: int) -> bool:
-                return any(str(v).strip() == "Fcst" for v in df_str.iloc[:, col].tolist())
-
-            # 5G/H process for this single year y
-            if has_year(start_col, y) or any(has_year(c, y) for c in yr_cols):
-                # choose a column
-                candidates = [c for c in yr_cols if has_year(c, y)]
-                col_choice = None
-                for c in candidates:
-                    if has_fcst(c):
-                        col_choice = c; break
-                if col_choice is None and candidates:
-                    col_choice = candidates[0]
-                if col_choice is not None:
-                    values[y][cgu] = to_float(df.iat[row_pbt, col_choice])
-
-    # ---- Build output ----
-    # Column sets are dynamic from mapper years
-    actual_cols = ["Actual|Opening"] + [f"Actual|{y}" for y in years_sorted]
-    overlay_cols = ["Overlays|Opening"] + [f"Overlays|{y}" for y in years_sorted]
-
-    rows = []
-    for cgu in cgus:
-        row = {
-            "entity": entity,
-            "business_line": cgu,
-            "Actual|Opening": 0.0,
-            "Overlays|Opening": 0.0,
-        }
-        # Actual values: if opening_dict exists and this is not opening year, subtract opening
-        for y in years_sorted:
-            base = values[y].get(cgu, 0.0)
-            if opening_year is not None and y != opening_year:
-                base = base - opening_dict.get(cgu, 0.0)
-            # if y == opening_year, treat Actual|{y} as the raw year value (spec implies subtraction vs opening only for later years)
-            row[f"Actual|{y}"] = base
-            row[f"Overlays|{y}"] = 0.0
-        rows.append(row)
-
-    cols_out = ["entity","business_line"] + actual_cols + overlay_cols
-    return pd.DataFrame(rows, columns=cols_out)
+if col_choice is not None:
+    values[y][cgu] = to_float(df.iat[row_pbt, col_choice])
