@@ -1,299 +1,286 @@
-def sheet_saracen_extra(ctx: Mapping[str, pd.DataFrame]) -> pd.DataFrame:
+def sheet_Latest_FRP_PBT_in_million_LCY(ctx: Mapping[str, pd.DataFrame]) -> pd.DataFrame:
     """
-    Build the 'saracen_extra' sheet.
+    Build 'Latest_FRP_PBT (in million LCY)'.
 
-    Inputs expected in ctx:
-      - ctx["nfa"]             -> from folder 'nfa', key 'NFA', sheet 'Driller' (raw matrix)
-      - ctx["saracen"]         -> from folder 'saracen', key 'Saracen', (first sheet used) — needed for Goodwill total
-      - ctx["tangible_equity"] -> from folder 'tangible_equity', key 'RoTE', sheet 'ROTE Detail Valued' (to recompute TE ratios)
-      - ctx["user_input"]      -> 'user_input' sheet
-
-    Output columns (one row per CGU):
-      entity | business_line | bank_premises_revaluation (in million LCY) |
-      saracen_goodwill (in million LCY) | saracen_intangible (in million LCY) |
-      pension_fund_assets (in million LCY) |
-      Goodwill and Intangible assets (in thousand LCY) |
-      CC allocation % (Goodwill and Intangible assets) |
-      Right-of-Use assets (RoU) (in thousand LCY) |
-      CC allocation % (Right-of-Use assets (RoU)) |
-      PPE (in thousand LCY) |
-      CC allocation % (PPE)
+    Needs:
+      - ctx["user_input"] sheet 'rwa_pbt_mapper' (we'll re-open it from disk to get that sheet)
+      - files in subfolder 'pbt' matched by mapper's 'filename keyword'
+      - For 'mimosa': sheet 'Sumpl_GB_Mimosa 1'
+      - For others: CGU sheets 'Total','CIB','IWPB','CC'
+    Output: rows per CGU with columns:
+      entity | business_line |
+      Actual|Opening | Actual|{years...} |
+      Overlays|Opening | Overlays|{years...}
     """
     import re
     import numpy as np
     import pandas as pd
-    from utility import ui_to_kv, parse_cgu_rollup
+    from utility import (
+        PipelineConfig, discover_files, pick_file_by_keyword, read_tablelike_any,
+        ui_to_kv, parse_cgu_rollup
+    )
 
-    # -------- helpers --------
+    # ---- helpers ----
     def to_float(x) -> float:
-        if pd.isna(x):
-            return 0.0
+        if pd.isna(x): return 0.0
         s = str(x).strip().replace(",", "")
-        if s == "":
-            return 0.0
+        if not s: return 0.0
+        try: return float(s)
+        except: return 0.0
+
+    def year_from_any(s: str) -> int | None:
         try:
-            return float(s)
+            y = pd.to_datetime(s, errors="coerce").year
+            return int(y) if pd.notna(y) else None
         except Exception:
-            return 0.0
+            pass
+        m = re.search(r"\b(19|20)\d{2}\b", str(s))
+        return int(m.group(0)) if m else None
 
-    def find_first(df_str: pd.DataFrame, target: str) -> tuple[int, int]:
-        """Find exact (case-insensitive) match anywhere; return (row, col)."""
-        hits = np.argwhere(df_str.values == target)
-        if hits.size:
-            return int(hits[0][0]), int(hits[0][1])
-        hits = np.argwhere(np.vectorize(lambda x: x.lower() == target.lower())(df_str.values))
-        if hits.size:
-            return int(hits[0][0]), int(hits[0][1])
-        raise ValueError(f"Label '{target}' not found.")
+    def open_user_sheet(sheet_name: str) -> pd.DataFrame:
+        """Re-open user_input workbook to read a specific sheet (e.g., 'rwa_pbt_mapper')."""
+        cfg: PipelineConfig = ctx["_cfg"]
+        files = discover_files(cfg, subfolder="user_input")
+        f = pick_file_by_keyword(files, "user_input", True, cfg.multi_match_policy)
+        if not f:
+            raise FileNotFoundError("user_input file not found for 'rwa_pbt_mapper'.")
+        dfs = read_tablelike_any(f, sheet_name=sheet_name)
+        # read_tablelike_any returns {name: df} if sheet_name set
+        df = next(iter(dfs.values()))
+        return df
 
-    # -------- inputs --------
-    nfa = ctx["nfa"]                # "Driller" sheet
-    saracen = ctx["saracen"]        # for goodwill number
-    te_input_df = ctx["tangible_equity"]  # to recompute TE ratios
+    def open_pbt_book(keyword: str) -> dict[str, pd.DataFrame]:
+        cfg: PipelineConfig = ctx["_cfg"]
+        files = discover_files(cfg, subfolder="pbt")
+        f = pick_file_by_keyword(files, keyword, True, cfg.multi_match_policy)
+        if not f:
+            raise FileNotFoundError(f"PBT file not found for keyword '{keyword}'")
+        return read_tablelike_any(f)  # all sheets
+
+    def first_match_pos(df_str: pd.DataFrame, pred) -> tuple[int,int] | None:
+        arr = df_str.values
+        for i in range(arr.shape[0]):
+            for j in range(arr.shape[1]):
+                try:
+                    if pred(arr[i, j]): return (i, j)
+                except Exception:
+                    continue
+        return None
+
+    def find_row_equals(df_str: pd.DataFrame, text: str) -> int | None:
+        t = text.strip().lower()
+        hits = np.argwhere(np.vectorize(lambda x: str(x).strip().lower() == t)(df_str.values))
+        return int(hits[0][0]) if hits.size else None
+
+    def find_row_contains(df_str: pd.DataFrame, text: str) -> int | None:
+        t = text.strip().lower()
+        hits = np.argwhere(np.vectorize(lambda x: t in str(x).strip().lower())(df_str.values))
+        return int(hits[0][0]) if hits.size else None
+
+    # ---- basics from user_input ----
     ui = ctx["user_input"]
-
-    # user_input basics
     kv = ui_to_kv(ui)
     entity = str(kv.get("entity", "")).strip()
     rollup_expr = kv.get("cgu_rollup") or kv.get("cgu_rollups") or ""
-    cgus = parse_cgu_rollup(rollup_expr)  # ['Total','CIB','IWPB','CC'] order typically
+    cgus = parse_cgu_rollup(rollup_expr)
+    # Ensure canonical CGU order / presence
+    cgus = [x for x in ["Total","CIB","IWPB","CC"] if x in set(cgus)]
 
-    # current year from testing_date — handle both 'YYYY-MM-DD 00:00:00' and 'MM/DD/YYYY'
-    td = str(kv.get("testing_date", "")).strip()
-    try:
-        current_year = pd.to_datetime(td, errors="coerce").year
-    except Exception:
-        current_year = None
-    if not current_year:
-        m = re.search(r"(\d{1,2})/(\d{1,2})/(\d{4})", td)
-        if not m:
-            raise ValueError(f"Cannot parse testing_date into a year: {td}")
-        current_year = int(m.group(3))
-    y_str = str(current_year)
+    # Read mapper sheet
+    mapper = open_user_sheet("rwa_pbt_mapper")
+    cols = {c.strip().lower(): c for c in mapper.columns.map(str)}
+    need = ["mapping","year","filename keyword","type"]
+    missing = [k for k in need if k not in cols]
+    if missing: raise KeyError(f"Missing columns in rwa_pbt_mapper: {missing}")
+    df_map = mapper.rename(columns={cols["mapping"]:"mapping",
+                                    cols["year"]:"year",
+                                    cols["filename keyword"]:"filename keyword",
+                                    cols["type"]:"type"})
+    df_map = df_map[df_map["mapping"].astype(str).str.strip().str.lower() == "pbt"].copy()
 
-    # -------- 1) Goodwill number from Saracen (AR00001 - Goodwill and Intangible assets), divide by 100 --------
-    sar_str = saracen.copy().applymap(lambda x: str(x).strip() if pd.notna(x) else "")
-    # Re-use the same "final column" selection approach as in saracen sheet:
-    # Find all columns with the current year present
-    candidate_cols = set()
-    # exact 'YYYY'
-    hits = np.argwhere(sar_str.values == y_str)
-    for r, c in hits:
-        candidate_cols.add(int(c))
-    # numeric 'YYYY.0' etc.
-    for j in range(sar_str.shape[1]):
-        col_vals = sar_str.iloc[:, j]
-        for val in col_vals:
-            try:
-                if int(float(val)) == current_year:
-                    candidate_cols.add(j)
-                    break
-            except Exception:
-                continue
-    if not candidate_cols:
-        # if none, default to last column
-        final_col_sar = sar_str.shape[1] - 1
-    else:
-        month_rank = {
-            "JAN": 1, "FEB": 2, "MAR": 3, "APR": 4, "MAY": 5, "JUN": 6,
-            "JUL": 7, "AUG": 8, "SEP": 9, "OCT": 10, "NOV": 11, "DEC": 12
-        }
-        def detect_month_score(col_idx: int) -> int:
-            pat = re.compile(r"^(JAN|FEB|MAR|APR|MAY|JUN|JUL|AUG|SEP|OCT|NOV|DEC)\s*-\s*\1$", re.I)
-            for txt in sar_str.iloc[:, col_idx]:
-                m = pat.match(txt)
-                if m:
-                    return month_rank[m.group(1).upper()]
-            return 0
-        if len(candidate_cols) == 1:
-            final_col_sar = next(iter(candidate_cols))
-        else:
-            ranked = sorted(((detect_month_score(c), c) for c in candidate_cols))
-            final_col_sar = ranked[-1][1]
+    # Collect unique years and rows
+    def as_int(y):
+        try: return int(float(y))
+        except: 
+            yi = year_from_any(str(y)); 
+            if yi is None: raise
+            return yi
 
-    # Find the row for "AR00001 - Goodwill and Intangible assets" (tolerate minor dash/space differences)
-    # We'll try a few variants:
-    goodwill_labels = [
-        "AR00001 - Goodwill and Intangible assets",
-        "AR00001- Goodwill and Intangible assets",
-        "AR00001 - Goodwill & Intangible assets",
-        "AR00001- Goodwill & Intangible assets",
-        "AR00001",  # last resort
-    ]
-    goodwill_row = None
-    for lab in goodwill_labels:
-        hits = np.argwhere(sar_str.values == lab)
-        if hits.size == 0:
-            hits = np.argwhere(np.vectorize(lambda x: x.lower() == lab.lower())(sar_str.values))
-        if hits.size:
-            goodwill_row = int(hits[0][0])
-            break
-    goodwill_number = to_float(saracen.iat[goodwill_row, final_col_sar]) if goodwill_row is not None else 0.0
-    # Divide by 100 as per your instruction (producing "in million LCY" per spec)
-    goodwill_million = goodwill_number / 100.0
-
-    # -------- 2) TE ratios (recompute like sheet_tangible_equity) --------
-    te_str = te_input_df.copy().applymap(lambda x: str(x).strip() if pd.notna(x) else "")
-
-    # Find entity row in TE sheet
-    pos_ent = np.argwhere(te_str.values == entity)
-    if pos_ent.size == 0:
-        pos_ent = np.argwhere(np.vectorize(lambda x: x.lower() == entity.lower())(te_str.values))
-    if pos_ent.size == 0:
-        raise ValueError(f"Entity '{entity}' not found in tangible_equity input.")
-    entity_row_idx = int(pos_ent[0][0])
-
-    def find_label_col(label: str) -> int:
-        """Return first column index where the label occurs anywhere."""
-        hits = np.argwhere(te_str.values == label)
-        if hits.size:
-            return int(hits[0][1])
-        hits = np.argwhere(np.vectorize(lambda x: x.lower() == label.lower())(te_str.values))
-        if hits.size:
-            return int(hits[0][1])
-        raise ValueError(f"Label '{label}' not found in tangible_equity input.")
-
-    te_vals: dict[str, float] = {}
-    for cgu in cgus:
-        cgu_new = "Corp Centre" if cgu == "CC" else cgu
-        variable = "Spot TE" if cgu_new == "Total" else f"{cgu_new} TE Spot"
-        col_idx = find_label_col(variable)
-        te_vals[cgu] = to_float(te_input_df.iat[entity_row_idx, col_idx])
-
-    te_total = te_vals.get("Total", 0.0)
-    te_ratio = {k: (v / te_total if te_total else 0.0) for k, v in te_vals.items()}
-
-    # -------- 3) saracen_intangible (in million LCY) per CGU --------
-    saracen_intangible_million = {cgu: goodwill_million * te_ratio.get(cgu, 0.0) for cgu in cgus}
-
-    # -------- 4–6) NFA "Driller": find latest month column among current-year columns, then find CGU column indices --------
-    nfa_str = nfa.copy().applymap(lambda x: str(x).strip() if pd.notna(x) else "")
-
-    # current-year candidate columns
-    candidate_cols_nfa = set()
-    hits = np.argwhere(nfa_str.values == y_str)
-    for r, c in hits:
-        candidate_cols_nfa.add(int(c))
-    for j in range(nfa_str.shape[1]):
-        col_vals = nfa_str.iloc[:, j]
-        for val in col_vals:
-            try:
-                if int(float(val)) == current_year:
-                    candidate_cols_nfa.add(j)
-                    break
-            except Exception:
-                continue
-    if not candidate_cols_nfa:
-        # fallback to last column
-        final_col_nfa = nfa_str.shape[1] - 1
-        latest_cols = [final_col_nfa]
-    else:
-        # pick all columns with a month token, then choose those with the latest month
-        month_rank = {
-            "JAN": 1, "FEB": 2, "MAR": 3, "APR": 4, "MAY": 5, "JUN": 6,
-            "JUL": 7, "AUG": 8, "SEP": 9, "OCT": 10, "NOV": 11, "DEC": 12
-        }
-        pat = re.compile(r"^(JAN|FEB|MAR|APR|MAY|JUN|JUL|AUG|SEP|OCT|NOV|DEC)\s*-\s*\1$", re.I)
-        scored = []
-        for c in candidate_cols_nfa:
-            score = 0
-            for txt in nfa_str.iloc[:, c]:
-                m = pat.match(txt)
-                if m:
-                    score = month_rank[m.group(1).upper()]
-                    break
-            scored.append((score, c))
-        if scored:
-            max_score = max(s for s, _ in scored)
-            latest_cols = [c for s, c in scored if s == max_score and s > 0]
-            if not latest_cols:  # if none had month markers, just use the rightmost candidate
-                latest_cols = [max(candidate_cols_nfa)]
-        else:
-            latest_cols = [max(candidate_cols_nfa)]
-
-    # Among latest columns, find where CGU markers appear
-    cgu_map = {"GB_Total": "Total", "IWB": "IWPB", "CIB": "CIB", "OTH": "CC"}
-    cgu_val_col: dict[str, int] = {}  # logical CGU -> column index
-    for code, logical in cgu_map.items():
-        # search in any of the latest cols for this code text
-        found_col = None
-        for c in latest_cols:
-            col_txts = nfa_str.iloc[:, c]
-            if any(code.lower() == t.lower() for t in col_txts):
-                found_col = c
-                break
-        # if not found, search exact anywhere and prefer if its column is in latest_cols
-        if found_col is None:
-            hits = np.argwhere(nfa_str.values == code)
-            if hits.size:
-                # prefer a hit whose col is in latest_cols, otherwise take first
-                cols = [int(col) for _, col in hits]
-                inter = [col for col in cols if col in latest_cols]
-                found_col = inter[0] if inter else cols[0]
-        if found_col is not None:
-            cgu_val_col[logical] = found_col
-
-    # -------- 7–8) label column for "G/W & Intang" then rows for Software / ROU / PPE --------
-    try:
-        _r, label_col = find_first(nfa_str, "G/W & Intang")
-    except Exception:
-        # some files use 'G/W & Intangibles'
-        _r, label_col = find_first(nfa_str, "G/W & Intangibles")
-
-    def find_row(label: str) -> int:
-        hits = np.argwhere(nfa_str.values == label)
-        if hits.size:
-            return int(hits[0][0])
-        hits = np.argwhere(np.vectorize(lambda x: x.lower() == label.lower())(nfa_str.values))
-        if hits.size:
-            return int(hits[0][0])
-        # also allow substring match within that label column
-        series = nfa_str.iloc[:, label_col].str.lower()
-        idxs = series[series.str.contains(label.lower(), na=False)].index.tolist()
-        if idxs:
-            return int(idxs[0])
-        raise ValueError(f"Row label '{label}' not found in NFA sheet.")
-
-    row_software = find_row("Software")
-    row_rou      = find_row("ROU")
-    row_ppe      = find_row("PPE")
-
-    # -------- 9) build rows per CGU --------
-    rows = []
-    for logical in ["Total", "CIB", "IWPB", "CC"]:
-        col_idx = cgu_val_col.get(logical)
-        # per-CGU values from NFA (in thousand LCY)
-        sw  = to_float(nfa.iat[row_software, col_idx]) if col_idx is not None else 0.0
-        rou = to_float(nfa.iat[row_rou,      col_idx]) if col_idx is not None else 0.0
-        ppe = to_float(nfa.iat[row_ppe,      col_idx]) if col_idx is not None else 0.0
-
-        rows.append({
-            "entity": entity,
-            "business_line": logical,
-            "bank_premises_revaluation (in million LCY)": 0.0,
-            "saracen_goodwill (in million LCY)": 0.0,
-            "saracen_intangible (in million LCY)": saracen_intangible_million.get(logical, 0.0),
-            "pension_fund_assets (in million LCY)": 0.0,
-            "Goodwill and Intangible assets (in thousand LCY)": sw,
-            "CC allocation % (Goodwill and Intangible assets)": 0.0,
-            "Right-of-Use assets (RoU) (in thousand LCY)": rou,
-            "CC allocation % (Right-of-Use assets (RoU))": 0.0,
-            "PPE (in thousand LCY)": ppe,
-            "CC allocation % (PPE)": 0.0,
+    entries = []
+    for _, r in df_map.iterrows():
+        try:
+            y = as_int(r["year"])
+        except Exception:
+            continue
+        entries.append({
+            "year": y,
+            "keyword": str(r["filename keyword"]).strip(),
+            "type": str(r["type"]).strip().lower(),
         })
+    if not entries:
+        # No mappings -> empty result with headers
+        cols_out = (["entity","business_line","Actual|Opening"]
+                    + []
+                    + ["Overlays|Opening"])
+        return pd.DataFrame(columns=cols_out)
 
-    cols = [
-        "entity",
-        "business_line",
-        "bank_premises_revaluation (in million LCY)",
-        "saracen_goodwill (in million LCY)",
-        "saracen_intangible (in million LCY)",
-        "pension_fund_assets (in million LCY)",
-        "Goodwill and Intangible assets (in thousand LCY)",
-        "CC allocation % (Goodwill and Intangible assets)",
-        "Right-of-Use assets (RoU) (in thousand LCY)",
-        "CC allocation % (Right-of-Use assets (RoU))",
-        "PPE (in thousand LCY)",
-        "CC allocation % (PPE)",
-    ]
-    return pd.DataFrame(rows, columns=cols)
+    years_sorted = sorted(sorted({e["year"] for e in entries}))
+    # Opening year (if we have a mimosa row → use that year as opening base)
+    opening_entry = next((e for e in entries if "mimosa" in e["keyword"].lower()), None)
+    opening_year = opening_entry["year"] if opening_entry else None
+
+    # ---- storage ----
+    # values[year][cgu] = value (float, in million LCY expected per inputs)
+    values: dict[int, dict[str, float]] = {y: {cgu: 0.0 for cgu in cgus} for y in years_sorted}
+    opening_dict = {cgu: 0.0 for cgu in cgus}
+
+    # ---- process each entry ----
+    for e in entries:
+        y = e["year"]; kw = e["keyword"]; typ = e["type"]
+        book = open_pbt_book(kw)
+
+        if "mimosa" in kw.lower():
+            # 4) Mimosa logic on 'Sumpl_GB_Mimosa 1'
+            sheet_name = None
+            # find sheet closest to target even if name variant exists
+            for s in book.keys():
+                if "sumpl_gb_mimosa 1".lower() == s.strip().lower():
+                    sheet_name = s; break
+            if sheet_name is None:
+                # loose search
+                sheet_name = next((s for s in book if "mimosa" in s.lower()), None)
+            if sheet_name is None:
+                raise KeyError("Could not find sheet 'Sumpl_GB_Mimosa 1' in Mimosa workbook")
+
+            df = book[sheet_name]
+            df_str = df.copy().applymap(lambda x: str(x).strip() if pd.notna(x) else "")
+
+            # 4A) CGU columns by substring
+            cgu_map = {
+                "International Wealth and Personal Banking": "IWPB",
+                "Corporate and Institutional Banking": "CIB",
+                "Corporate Centre": "CC",
+            }
+            value_cols: dict[str, int] = {}
+            for col_idx in range(df_str.shape[1]):
+                col_txts = " ".join(df_str.iloc[:, col_idx].astype(str).tolist()).lower()
+                for key, logical in cgu_map.items():
+                    if logical in value_cols:  # already set
+                        continue
+                    if key.lower() in col_txts:
+                        value_cols[logical] = col_idx
+
+            # 4B) value row by substring "Profit Before Tax"
+            row_pbt = find_row_contains(df_str, "Profit Before Tax")
+            if row_pbt is None:
+                raise ValueError("Row containing 'Profit Before Tax' not found in Mimosa sheet.")
+
+            # 4C) values per CGU and Total
+            total_val = 0.0
+            for logical in ["CIB","IWPB","CC"]:
+                col_idx = value_cols.get(logical)
+                v = to_float(df.iat[row_pbt, col_idx]) if col_idx is not None else 0.0
+                values[y][logical] = v
+                total_val += v
+            values[y]["Total"] = total_val
+
+            # Treat Mimosa year as opening base
+            opening_dict.update(values[y])
+            continue
+
+        # 5) Other files
+        # Depending on type: we only have 'forecasted' rule now
+        # Sheets per CGU
+        for cgu in cgus:
+            # get sheet by exact match or case-insensitive
+            sheet = None
+            for s in book.keys():
+                if s.strip().lower() == cgu.lower():
+                    sheet = s; break
+            if sheet is None:
+                # try variants e.g., 'Corp Centre' for CC if present
+                if cgu == "CC":
+                    var = next((s for s in book if "corp" in s.lower() and "centre" in s.lower()), None)
+                    sheet = var
+            if sheet is None:
+                continue  # skip if sheet missing
+
+            df = book[sheet]
+            df_str = df.copy().applymap(lambda x: str(x).strip() if pd.notna(x) else "")
+
+            # 5C) find "Full Year Trend" exact cells on some row,
+            # take contiguous run to the right while the same text repeats
+            pos = first_match_pos(df_str, lambda x: str(x).strip() == "Full Year Trend")
+            if not pos:
+                # allow case-insensitive exact
+                pos = first_match_pos(df_str, lambda x: str(x).strip().lower() == "full year trend")
+            if not pos:
+                continue  # cannot extract for this CGU/sheet
+            row_idx, start_col = pos
+            end_col = start_col
+            while end_col + 1 < df_str.shape[1] and df_str.iat[row_idx, end_col + 1].strip().lower() == "full year trend":
+                end_col += 1
+            # range where years should appear
+            yr_cols = list(range(start_col, end_col + 1))
+
+            # 5D) within that range, pick columns whose column text (somewhere) has the target year
+            # 5E) in those, pick the one where some cell equals 'Fcst'
+            # 5F) row 'Profit Before Tax'
+            row_pbt = find_row_equals(df_str, "Profit Before Tax")
+            if row_pbt is None:
+                row_pbt = find_row_contains(df_str, "Profit Before Tax")
+            if row_pbt is None:
+                continue
+
+            # Find all candidate columns for this target year
+            # We search for an exact 'YYYY' token anywhere in that column
+            def has_year(col: int, y: int) -> bool:
+                col_vals = df_str.iloc[:, col].tolist()
+                for txt in col_vals:
+                    yy = year_from_any(txt)
+                    if yy == y:
+                        return True
+                return False
+
+            # Among year columns, prefer one that has an exact 'Fcst'
+            def has_fcst(col: int) -> bool:
+                return any(str(v).strip() == "Fcst" for v in df_str.iloc[:, col].tolist())
+
+            # 5G/H process for this single year y
+            if has_year(start_col, y) or any(has_year(c, y) for c in yr_cols):
+                # choose a column
+                candidates = [c for c in yr_cols if has_year(c, y)]
+                col_choice = None
+                for c in candidates:
+                    if has_fcst(c):
+                        col_choice = c; break
+                if col_choice is None and candidates:
+                    col_choice = candidates[0]
+                if col_choice is not None:
+                    values[y][cgu] = to_float(df.iat[row_pbt, col_choice])
+
+    # ---- Build output ----
+    # Column sets are dynamic from mapper years
+    actual_cols = ["Actual|Opening"] + [f"Actual|{y}" for y in years_sorted]
+    overlay_cols = ["Overlays|Opening"] + [f"Overlays|{y}" for y in years_sorted]
+
+    rows = []
+    for cgu in cgus:
+        row = {
+            "entity": entity,
+            "business_line": cgu,
+            "Actual|Opening": 0.0,
+            "Overlays|Opening": 0.0,
+        }
+        # Actual values: if opening_dict exists and this is not opening year, subtract opening
+        for y in years_sorted:
+            base = values[y].get(cgu, 0.0)
+            if opening_year is not None and y != opening_year:
+                base = base - opening_dict.get(cgu, 0.0)
+            # if y == opening_year, treat Actual|{y} as the raw year value (spec implies subtraction vs opening only for later years)
+            row[f"Actual|{y}"] = base
+            row[f"Overlays|{y}"] = 0.0
+        rows.append(row)
+
+    cols_out = ["entity","business_line"] + actual_cols + overlay_cols
+    return pd.DataFrame(rows, columns=cols_out)
