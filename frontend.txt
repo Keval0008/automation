@@ -1,151 +1,118 @@
-# frontend.py
-import threading
-from datetime import datetime
-from pathlib import Path
+import os
 import tkinter as tk
-from tkinter import ttk, filedialog, messagebox
+from tkinter import filedialog, messagebox, ttk
+from tkinter import StringVar
+import threading
 
-from utility import PipelineConfig, InputSpec
-from backend import run_pipeline, sheet_Discount_rate  # add more sheet functions later
+# Dummy function to simulate sheet processing
+def run_population(sheet_funcs, output_callback, progress_callback, complete_callback):
+    total = len(sheet_funcs)
+    for i, (sheet_name, func) in enumerate(sheet_funcs.items(), 1):
+        # simulate processing
+        progress_callback(i, total, f"Populating {sheet_name}...")
+        func()  # run actual function
+    complete_callback()
 
+class HBMEApp:
+    def __init__(self, root, sheet_funcs):
+        self.root = root
+        self.root.title("HBME Input Automation")
+        self.root.geometry("600x400")
+        self.root.configure(bg="white")
 
-class App(tk.Tk):
-    def __init__(self):
-        super().__init__()
-        self.title("Excel Pipeline Tool")
-        self.geometry("640x220")
-        self._build_ui()
+        self.sheet_funcs = sheet_funcs
+        self.input_folder = None
+        self.output_file = None
+        self.status_var = StringVar()
+        self.folder_var = StringVar(value="Select Input Folder and Output Folder to begin")
 
-    # ---------------- UI ----------------
-    def _build_ui(self):
-        pad = 10
-        frm = ttk.Frame(self)
-        frm.pack(fill="both", expand=True, padx=pad, pady=pad)
+        # Title
+        tk.Label(root, text="HBME Input Automation", font=("Segoe UI", 16, "bold"), bg="white").pack(pady=15)
 
-        # Master folder
-        ttk.Label(frm, text="Master folder:").grid(row=0, column=0, sticky="e", padx=(0, 8))
-        self.master_var = tk.StringVar()
-        ttk.Entry(frm, textvariable=self.master_var, width=54).grid(row=0, column=1, sticky="we")
-        ttk.Button(frm, text="Browse", command=self._browse_master).grid(row=0, column=2, padx=(8, 0))
+        # Input folder section
+        tk.Label(root, text="Select Input Folder", font=("Segoe UI", 11), bg="white").pack()
+        frame = tk.Frame(root, bg="white")
+        frame.pack(pady=5)
+        self.entry = tk.Entry(frame, textvariable=self.folder_var, width=50, state="readonly")
+        self.entry.pack(side="left", padx=(0, 10))
+        tk.Button(frame, text="Browse", bg="#f5c542", command=self.browse_folder).pack(side="left")
 
-        # Output folder
-        ttk.Label(frm, text="Output folder:").grid(row=1, column=0, sticky="e", padx=(0, 8))
-        self.output_var = tk.StringVar()
-        ttk.Entry(frm, textvariable=self.output_var, width=54).grid(row=1, column=1, sticky="we")
-        ttk.Button(frm, text="Browse", command=self._browse_output).grid(row=1, column=2, padx=(8, 0))
+        # Status text
+        self.status_label = tk.Label(root, textvariable=self.folder_var, font=("Segoe UI", 10), fg="gray", bg="white")
+        self.status_label.pack(pady=(5, 10))
 
         # Run button
-        self.run_btn = ttk.Button(frm, text="Run", command=self._on_run_clicked)
-        self.run_btn.grid(row=2, column=1, pady=(pad, 0), sticky="w")
+        tk.Button(root, text="Run Input Population", bg="#f5c542", font=("Segoe UI", 12, "bold"),
+                  command=self.run_population_thread).pack(pady=10)
 
-        # One-line status
-        self.status_var = tk.StringVar(value="Ready.")
-        ttk.Label(frm, textvariable=self.status_var, foreground="#0A58CA").grid(
-            row=3, column=0, columnspan=3, sticky="w", pady=(pad, 0)
-        )
+        # Progress bar + status
+        self.progress = ttk.Progressbar(root, length=400, mode="determinate")
+        self.progress.pack(pady=10)
+        self.progress_label = tk.Label(root, text="", bg="white", font=("Segoe UI", 10))
+        self.progress_label.pack()
 
-        frm.grid_columnconfigure(1, weight=1)
+        # Download button
+        self.download_btn = tk.Button(root, text="Download Input Template", bg="#f5c542",
+                                      command=self.download_template, state="disabled")
+        self.download_btn.pack(pady=10)
 
-    # ---------------- Browsers ----------------
-    def _browse_master(self):
-        d = filedialog.askdirectory(title="Select master folder")
-        if d:
-            self.master_var.set(d)
+        # Output path display
+        self.output_label = tk.Label(root, text="", bg="white", font=("Segoe UI", 9, "italic"))
+        self.output_label.pack(pady=(5, 0))
 
-    def _browse_output(self):
-        d = filedialog.askdirectory(title="Select output folder")
-        if d:
-            self.output_var.set(d)
+    def browse_folder(self):
+        folder = filedialog.askdirectory()
+        if folder:
+            self.input_folder = folder
+            self.folder_var.set(folder)
 
-    # ---------------- Status & Password ----------------
-    def report(self, msg: str):
-        # One-liner status
-        self.status_var.set(msg)
-        self.update_idletasks()
-
-    def password_provider(self, filename: str) -> str:
-        """Modal popup to get password for a protected workbook."""
-        dlg = tk.Toplevel(self)
-        dlg.title("Password required")
-        dlg.transient(self)
-        dlg.grab_set()
-
-        ttk.Label(dlg, text=f"Enter password for:\n{filename}").pack(padx=12, pady=(12, 6))
-        var = tk.StringVar()
-        entry = ttk.Entry(dlg, textvariable=var, show="*")
-        entry.pack(padx=12, pady=(0, 12))
-        entry.focus_set()
-
-        out = {"pw": None}
-
-        def submit():
-            out["pw"] = var.get()
-            dlg.destroy()
-
-        ttk.Button(dlg, text="Submit", command=submit).pack(pady=(0, 12))
-        self.wait_window(dlg)
-        return out["pw"] or ""
-
-    # ---------------- Run ----------------
-    def _on_run_clicked(self):
-        master = self.master_var.get().strip()
-        out_folder = self.output_var.get().strip()
-        if not master or not out_folder:
-            messagebox.showwarning("Missing paths", "Please select both Master folder and Output folder.")
+    def run_population_thread(self):
+        if not self.input_folder:
+            messagebox.showwarning("Warning", "Please select an input folder first.")
             return
 
-        self.run_btn.config(state="disabled")
-        self.status_var.set("Processing...")
+        self.progress["value"] = 0
+        self.progress_label.config(text="Starting population...")
+        thread = threading.Thread(target=run_population,
+                                  args=(self.sheet_funcs, self.save_output,
+                                        self.update_progress, self.population_complete))
+        thread.start()
 
-        def worker():
-            try:
-                # Config
-                cfg = PipelineConfig(master_folder=master)
+    def update_progress(self, current, total, status):
+        percent = int((current / total) * 100)
+        self.progress["value"] = percent
+        self.progress_label.config(text=f"{status} ({percent}%)")
+        self.root.update_idletasks()
 
-                # Inputs (you can add more later)
-                inputs = [
-                    InputSpec(
-                        logical_name="discount_rate",
-                        subfolder="discount_rate",
-                        keyword="CoE rates",          # filename keyword
-                        sheet_name=None               # you can set a sheet if needed
-                    ),
-                    InputSpec(
-                        logical_name="user_input",
-                        subfolder="user_input",
-                        keyword="user_input",
-                        sheet_name="user_input"       # as per your spec
-                    ),
-                ]
+    def save_output(self, suggested_name="HBME_input_template.xlsx"):
+        file_path = filedialog.asksaveasfilename(defaultextension=".xlsx",
+                                                 initialfile=suggested_name,
+                                                 filetypes=[("Excel files", "*.xlsx")])
+        if file_path:
+            self.output_file = file_path
+            # Save Excel here
+            # workbook.save(file_path)
+            self.output_label.config(text=f"Output saved at: {file_path}")
+            self.download_btn["state"] = "normal"
 
-                # Sheet functions (extend as we implement more)
-                sheet_funcs = {
-                    "Discount_rate": sheet_Discount_rate,
-                }
+    def population_complete(self):
+        messagebox.showinfo("Completed", "Input Population completed successfully!")
+        if not self.output_file:
+            self.save_output()
 
-                # Output file name inside the chosen folder
-                ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-                out_path = Path(out_folder) / f"input_template_{ts}.xlsx"
-
-                self.report("Running pipeline...")
-                run_pipeline(
-                    cfg=cfg,
-                    inputs=inputs,
-                    sheet_funcs=sheet_funcs,
-                    output_path=out_path,
-                    password_provider=self.password_provider,
-                    report=self.report,
-                )
-                self.report(f"Saved: {out_path}")
-                messagebox.showinfo("Success", f"Output saved to:\n{out_path}")
-            except Exception as e:
-                self.report(f"Error: {e}")
-                messagebox.showerror("Error", str(e))
-            finally:
-                self.run_btn.config(state="normal")
-
-        threading.Thread(target=worker, daemon=True).start()
+    def download_template(self):
+        if self.output_file:
+            os.startfile(self.output_file)  # re-open saved file
 
 
 if __name__ == "__main__":
-    App().mainloop()
+    # Example dummy dict
+    sheet_funcs = {
+        "Sheet1": lambda: None,
+        "Sheet2": lambda: None,
+        "Sheet3": lambda: None
+    }
+
+    root = tk.Tk()
+    app = HBMEApp(root, sheet_funcs)
+    root.mainloop()
