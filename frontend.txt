@@ -1,118 +1,328 @@
+# frontend.py
 import os
-import tkinter as tk
-from tkinter import filedialog, messagebox, ttk
-from tkinter import StringVar
+import sys
+import shutil
+import tempfile
 import threading
+from pathlib import Path
+import tkinter as tk
+from tkinter import ttk, filedialog, messagebox
 
-# Dummy function to simulate sheet processing
-def run_population(sheet_funcs, output_callback, progress_callback, complete_callback):
-    total = len(sheet_funcs)
-    for i, (sheet_name, func) in enumerate(sheet_funcs.items(), 1):
-        # simulate processing
-        progress_callback(i, total, f"Populating {sheet_name}...")
-        func()  # run actual function
-    complete_callback()
+from utility import PipelineConfig, InputSpec
+from backend import run_pipeline
 
-class HBMEApp:
-    def __init__(self, root, sheet_funcs):
-        self.root = root
-        self.root.title("HBME Input Automation")
-        self.root.geometry("600x400")
-        self.root.configure(bg="white")
+# ------------------------------
+# Hook up your actual sheet funcs here
+# ------------------------------
+# Build your inputs and sheet_funcs exactly like you do in your script/run.
+# For example:
+#
+# from backend import (
+#     sheet_discount_rate, sheet_Growth_rate_in_Percentage, sheet_CET1_required,
+#     sheet_look_ahead, sheet_Manual_Adjustments_Mn_LCY, sheet_tangible_equity,
+#     sheet_saracen_in_thousand_LCY, sheet_saracen_extra,
+#     sheet_Latest_FRP_PBT_in_million_LCY, sheet_Tax_input,
+#     sheet_default_scenarios, sheet_custom_BEP_presets, sheet_dta_adjustments,
+#     sheet_Manual_Adjustments_Mn_LCY,  # etc...
+# )
+#
+# Then build INPUT_SPECS and SHEET_FUNCS below.
 
-        self.sheet_funcs = sheet_funcs
-        self.input_folder = None
-        self.output_file = None
-        self.status_var = StringVar()
-        self.folder_var = StringVar(value="Select Input Folder and Output Folder to begin")
+# ---- PLACEHOLDER: edit these for your project ----
+# Minimal defaults so UI can launch. Replace with your real ones.
+INPUT_SPECS = [
+    # Example inputs; replace with your real InputSpec list
+    # InputSpec(logical_name="user_input", subfolder="user_input", keyword="user_input", sheet_name="user_input"),
+]
+SHEET_FUNCS = {
+    # "Discount_rate": sheet_discount_rate,
+    # "Growth_rate (in Percentage)": sheet_Growth_rate_in_Percentage,
+    # ...
+}
+
+
+class HBMEApp(tk.Tk):
+    def __init__(self, inputs, sheet_funcs):
+        super().__init__()
+        self.title("HBME Input Automation")
+        self.geometry("760x520")
+        self.minsize(740, 500)
+        self.configure(bg="#ffffff")
+
+        # Data
+        self.inputs = inputs
+        self.sheet_funcs = dict(sheet_funcs)  # copy
+        self.master_folder = ""
+        self.temp_output = None   # temp xlsx path from backend run
+        self.saved_output = None  # final user-saved path
+
+        # UI state
+        self.master_var = tk.StringVar(value="")
+        self.info_var = tk.StringVar(value="Select Input Folder to begin")
+        self.progress_var = tk.IntVar(value=0)
+        self.progress_text = tk.StringVar(value="")
+        self.output_path_var = tk.StringVar(value="")
+        self.run_enabled = True
+
+        self._build_ui()
+
+    # ---------- UI ----------
+    def _build_ui(self):
+        pad = 12
 
         # Title
-        tk.Label(root, text="HBME Input Automation", font=("Segoe UI", 16, "bold"), bg="white").pack(pady=15)
+        title = tk.Label(
+            self, text="HBME Input Automation",
+            font=("Segoe UI", 20, "bold"),
+            bg="#ffffff", fg="#222222",
+        )
+        title.pack(pady=(18, 10))
 
-        # Input folder section
-        tk.Label(root, text="Select Input Folder", font=("Segoe UI", 11), bg="white").pack()
-        frame = tk.Frame(root, bg="white")
-        frame.pack(pady=5)
-        self.entry = tk.Entry(frame, textvariable=self.folder_var, width=50, state="readonly")
-        self.entry.pack(side="left", padx=(0, 10))
-        tk.Button(frame, text="Browse", bg="#f5c542", command=self.browse_folder).pack(side="left")
+        body = tk.Frame(self, bg="#ffffff")
+        body.pack(fill="both", expand=True, padx=pad, pady=(0, pad))
 
-        # Status text
-        self.status_label = tk.Label(root, textvariable=self.folder_var, font=("Segoe UI", 10), fg="gray", bg="white")
-        self.status_label.pack(pady=(5, 10))
+        # Select input folder label
+        tk.Label(
+            body, text="Select Input Folder", font=("Segoe UI", 11),
+            bg="#ffffff", fg="#333333"
+        ).grid(row=0, column=0, sticky="w", padx=(2, 2), pady=(6, 6), columnspan=3)
+
+        # Entry + Browse
+        row1 = tk.Frame(body, bg="#ffffff")
+        row1.grid(row=1, column=0, columnspan=3, sticky="we")
+        self.entry = ttk.Entry(row1, textvariable=self.master_var, width=78, state="readonly")
+        self.entry.pack(side="left", padx=(0, 10), pady=(0, 2), fill="x", expand=True)
+
+        browse = ttk.Button(row1, text="Browse", command=self._browse_master)
+        browse.pack(side="left")
+
+        # Instruction / selected path line
+        self.info_label = tk.Label(
+            body, textvariable=self.info_var, font=("Segoe UI", 10),
+            bg="#ffffff", fg="#666666", anchor="w"
+        )
+        self.info_label.grid(row=2, column=0, columnspan=3, sticky="we", pady=(6, 14))
 
         # Run button
-        tk.Button(root, text="Run Input Population", bg="#f5c542", font=("Segoe UI", 12, "bold"),
-                  command=self.run_population_thread).pack(pady=10)
+        self.run_btn = tk.Button(
+            body, text="Run Input Population",
+            font=("Segoe UI", 12, "bold"),
+            bg="#f0c54a", fg="#222",
+            activebackground="#e6b73a",
+            relief="flat", padx=16, pady=6,
+            command=self._run_clicked
+        )
+        self.run_btn.grid(row=3, column=0, sticky="w", pady=(0, 8))
 
-        # Progress bar + status
-        self.progress = ttk.Progressbar(root, length=400, mode="determinate")
-        self.progress.pack(pady=10)
-        self.progress_label = tk.Label(root, text="", bg="white", font=("Segoe UI", 10))
-        self.progress_label.pack()
+        # Download button (disabled until we have a saved output)
+        self.download_btn = tk.Button(
+            body, text="Download Input Template",
+            font=("Segoe UI", 11),
+            bg="#f0c54a", fg="#222",
+            activebackground="#e6b73a",
+            relief="flat", padx=12, pady=5,
+            command=self._download_output, state="disabled"
+        )
+        self.download_btn.grid(row=3, column=1, sticky="w", padx=(14, 0), pady=(0, 8))
 
-        # Download button
-        self.download_btn = tk.Button(root, text="Download Input Template", bg="#f5c542",
-                                      command=self.download_template, state="disabled")
-        self.download_btn.pack(pady=10)
+        # Progress bar + text
+        self.progress = ttk.Progressbar(body, length=520, mode="determinate", variable=self.progress_var)
+        self.progress.grid(row=4, column=0, columnspan=3, sticky="w", pady=(8, 4))
+        self.progress_label = tk.Label(
+            body, textvariable=self.progress_text, font=("Segoe UI", 10), bg="#ffffff", fg="#333333"
+        )
+        self.progress_label.grid(row=5, column=0, columnspan=3, sticky="w")
 
         # Output path display
-        self.output_label = tk.Label(root, text="", bg="white", font=("Segoe UI", 9, "italic"))
-        self.output_label.pack(pady=(5, 0))
+        tk.Label(body, text="Output:", font=("Segoe UI", 10, "bold"), bg="#ffffff").grid(
+            row=6, column=0, sticky="w", pady=(16, 4)
+        )
+        self.output_label = tk.Label(
+            body, textvariable=self.output_path_var, font=("Segoe UI", 9), bg="#ffffff", fg="#555555", anchor="w",
+            wraplength=700, justify="left"
+        )
+        self.output_label.grid(row=7, column=0, columnspan=3, sticky="we")
 
-    def browse_folder(self):
-        folder = filedialog.askdirectory()
+        body.grid_columnconfigure(0, weight=1)
+        body.grid_columnconfigure(1, weight=0)
+        body.grid_columnconfigure(2, weight=0)
+
+        # Ttk styling for a nicer look
+        style = ttk.Style(self)
+        style.theme_use("default")
+        style.configure("TProgressbar", thickness=14)
+
+    # ---------- Actions ----------
+    def _browse_master(self):
+        folder = filedialog.askdirectory(title="Select Input (Master) Folder")
         if folder:
-            self.input_folder = folder
-            self.folder_var.set(folder)
+            self.master_folder = folder
+            self.master_var.set(folder)
+            self.info_var.set(folder)
 
-    def run_population_thread(self):
-        if not self.input_folder:
-            messagebox.showwarning("Warning", "Please select an input folder first.")
+    def _run_clicked(self):
+        if not self.master_folder:
+            messagebox.showwarning("Missing folder", "Please select the input (master) folder first.")
             return
 
-        self.progress["value"] = 0
-        self.progress_label.config(text="Starting population...")
-        thread = threading.Thread(target=run_population,
-                                  args=(self.sheet_funcs, self.save_output,
-                                        self.update_progress, self.population_complete))
-        thread.start()
+        if not self.sheet_funcs:
+            messagebox.showwarning("No sheets", "No sheet functions are configured.")
+            return
 
-    def update_progress(self, current, total, status):
-        percent = int((current / total) * 100)
-        self.progress["value"] = percent
-        self.progress_label.config(text=f"{status} ({percent}%)")
-        self.root.update_idletasks()
+        # Reset UI
+        self.progress_var.set(0)
+        self.progress_text.set("Starting…")
+        self.output_path_var.set("")
+        self.download_btn.config(state="disabled")
+        self.run_btn.config(state="disabled")
 
-    def save_output(self, suggested_name="HBME_input_template.xlsx"):
-        file_path = filedialog.asksaveasfilename(defaultextension=".xlsx",
-                                                 initialfile=suggested_name,
-                                                 filetypes=[("Excel files", "*.xlsx")])
-        if file_path:
-            self.output_file = file_path
-            # Save Excel here
-            # workbook.save(file_path)
-            self.output_label.config(text=f"Output saved at: {file_path}")
-            self.download_btn["state"] = "normal"
+        # Run in a background thread
+        threading.Thread(target=self._do_run, daemon=True).start()
 
-    def population_complete(self):
-        messagebox.showinfo("Completed", "Input Population completed successfully!")
-        if not self.output_file:
-            self.save_output()
+    def _wrap_sheet_funcs_for_progress(self, sheet_funcs):
+        """
+        Return a new dict of sheet functions that update the progress bar
+        as each sheet finishes. We don't need backend changes for this.
+        """
+        total = len(sheet_funcs)
+        count = {"done": 0}
 
-    def download_template(self):
-        if self.output_file:
-            os.startfile(self.output_file)  # re-open saved file
+        def make_wrapper(name, func):
+            def wrapped(ctx):
+                # announce start
+                self._report(f"Populating '{name}'…")
+                res = func(ctx)  # run the actual sheet function
+                # bump progress
+                count["done"] += 1
+                pct = int((count["done"] / total) * 100)
+                self._set_progress(pct, f"{count['done']}/{total} completed ({pct}%)")
+                return res
+            return wrapped
+
+        return {name: make_wrapper(name, fn) for name, fn in sheet_funcs.items()}
+
+    def _do_run(self):
+        try:
+            # Build config with the selected master folder
+            cfg = PipelineConfig(master_folder=self.master_folder)
+
+            # Wrap sheet funcs to update progress as each finishes
+            wrapped_funcs = self._wrap_sheet_funcs_for_progress(self.sheet_funcs)
+
+            # Write to a temp file first; we'll ask user where to save after completion
+            tmp_dir = tempfile.mkdtemp(prefix="hbme_")
+            self.temp_output = str(Path(tmp_dir) / "HBME_input_template.xlsx")
+
+            # Kick off backend
+            run_pipeline(
+                cfg=cfg,
+                inputs=INPUT_SPECS,
+                sheet_funcs=wrapped_funcs,
+                output_path=self.temp_output,
+                password_provider=self._password_provider_modal,
+                report=self._report,  # also collect backend logs if it calls report()
+            )
+
+            # On completion, prompt for Save As
+            self._report("Population completed.")
+            self._prompt_save_output()
+
+        except Exception as e:
+            self._report(f"ERROR: {e}")
+            messagebox.showerror("Error", str(e))
+        finally:
+            self.run_btn.config(state="normal")
+
+    # ---------- Save / Download ----------
+    def _prompt_save_output(self):
+        suggested = "HBME_input_template.xlsx"
+        save_path = filedialog.asksaveasfilename(
+            title="Save Output Excel",
+            defaultextension=".xlsx",
+            initialfile=suggested,
+            filetypes=[("Excel files", "*.xlsx")],
+        )
+        if not save_path:
+            # user canceled; keep temp file and allow download button to open folder
+            self.output_path_var.set(f"Output created at temporary path:\n{self.temp_output}")
+            self.download_btn.config(state="normal")
+            return
+
+        # Copy temp file to chosen location
+        try:
+            shutil.copyfile(self.temp_output, save_path)
+            self.saved_output = save_path
+            self.output_path_var.set(f"Output saved to:\n{save_path}")
+            self.download_btn.config(state="normal")
+            messagebox.showinfo("Success", f"Output saved to:\n{save_path}")
+        except Exception as e:
+            messagebox.showerror("Save failed", str(e))
+            self.output_path_var.set(f"Temporary output at:\n{self.temp_output}")
+            self.download_btn.config(state="normal")
+
+    def _download_output(self):
+        # Re-open saved output or open temp location
+        target = self.saved_output or self.temp_output
+        if not target or not os.path.exists(target):
+            messagebox.showwarning("File missing", "No output file is available yet.")
+            return
+        try:
+            if sys.platform.startswith("win"):
+                os.startfile(target)  # type: ignore[attr-defined]
+            elif sys.platform == "darwin":
+                os.system(f'open "{target}"')
+            else:
+                os.system(f'xdg-open "{target}"')
+        except Exception as e:
+            messagebox.showerror("Open failed", str(e))
+
+    # ---------- Reporting & Progress ----------
+    def _set_progress(self, value, text=None):
+        self.progress_var.set(max(0, min(100, int(value))))
+        if text is not None:
+            self.progress_text.set(text)
+        self.update_idletasks()
+
+    def _report(self, msg: str):
+        # One-liner status just under the progress bar
+        self.progress_text.set(msg)
+        self.update_idletasks()
+
+    # ---------- Password modal ----------
+    def _password_provider_modal(self, filename: str) -> str:
+        dlg = tk.Toplevel(self)
+        dlg.title("Password required")
+        dlg.configure(bg="#ffffff")
+        dlg.resizable(False, False)
+
+        tk.Label(
+            dlg, text=f"Enter password for:\n{filename}",
+            font=("Segoe UI", 10), bg="#ffffff", fg="#333333", justify="left"
+        ).pack(padx=16, pady=(14, 8))
+
+        var = tk.StringVar()
+        entry = ttk.Entry(dlg, textvariable=var, show="*")
+        entry.pack(padx=16, pady=(0, 12), fill="x")
+        entry.focus_set()
+
+        out = {"pw": ""}
+
+        def submit():
+            out["pw"] = var.get().strip()
+            dlg.destroy()
+
+        btn = ttk.Button(dlg, text="Submit", command=submit)
+        btn.pack(pady=(0, 14))
+        dlg.transient(self)
+        dlg.grab_set()
+        self.wait_window(dlg)
+
+        if not out["pw"]:
+            messagebox.showwarning("Password", "Empty password provided. You may be prompted again.")
+        return out["pw"] or ""
 
 
 if __name__ == "__main__":
-    # Example dummy dict
-    sheet_funcs = {
-        "Sheet1": lambda: None,
-        "Sheet2": lambda: None,
-        "Sheet3": lambda: None
-    }
-
-    root = tk.Tk()
-    app = HBMEApp(root, sheet_funcs)
-    root.mainloop()
+    # Replace INPUT_SPECS and SHEET_FUNCS above with your real pipeline.
+    app = HBMEApp(inputs=INPUT_SPECS, sheet_funcs=SHEET_FUNCS)
+    app.mainloop()
